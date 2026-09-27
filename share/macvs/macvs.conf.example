@@ -1,0 +1,41 @@
+# macvs global configuration (shell syntax). Copy to $MACVS_HOME/config (default
+# ~/.macvs/config). Every setting is optional; these are the built-in defaults.
+
+# Debian release codename and cloud-image variant used by `macvs create`.
+# trixie = Debian 13. Variants: generic (all drivers) or genericcloud (smaller).
+#MACVS_DEFAULT_RELEASE=trixie
+#MACVS_DEFAULT_VARIANT=generic
+
+# Default VM sizing.
+#MACVS_DEFAULT_CPUS=2
+#MACVS_DEFAULT_MEMORY=2048      # MiB
+#MACVS_DEFAULT_DISK=25G
+
+# Guest admin user created by cloud-init.
+#MACVS_DEFAULT_USER=admin
+
+# Address host port-forwards bind to. 127.0.0.1 keeps VMs reachable only from
+# this Mac; 0.0.0.0 exposes the forwarded ports on your LAN.
+#MACVS_DEFAULT_BIND=127.0.0.1
+
+# First SSH port tried when --ssh-port is not given (next free one is used).
+#MACVS_DEFAULT_SSH_PORT_BASE=2222
+
+# QEMU disk cache mode: writeback (fast, default) or writethrough (safer on host power loss).
+#MACVS_DEFAULT_DISK_CACHE=writeback
+
+# Seconds to wait for a clean ACPI shutdown before forcing QEMU to quit.
+#MACVS_STOP_TIMEOUT=90
+
+# Seconds `create --start` / `wait` will wait for first SSH.
+#MACVS_SSH_TIMEOUT=300
+
+# launchd label prefix; jobs are named <prefix>.<vm-name>.
+#MACVS_LAUNCHD_PREFIX=com.carteratl.macvs
+
+# Where images come from (a Debian cloud-image mirror with SHA512SUMS).
+#MACVS_IMAGE_BASE_URL=https://cloud.debian.org/images/cloud
+
+# Override QEMU discovery if it is not on PATH or firmware lives elsewhere.
+#MACVS_QEMU_BIN=/opt/homebrew/bin/qemu-system-aarch64
+#MACVS_QEMU_SHARE=/opt/homebrew/share/qemu
