@@ -17,7 +17,7 @@ MACVS_DEFAULT_CPUS="${MACVS_DEFAULT_CPUS:-2}"
 MACVS_DEFAULT_MEMORY="${MACVS_DEFAULT_MEMORY:-2048}"            # MiB
 MACVS_DEFAULT_DISK="${MACVS_DEFAULT_DISK:-25G}"
 MACVS_DEFAULT_USER="${MACVS_DEFAULT_USER:-admin}"
-MACVS_DEFAULT_BIND="${MACVS_DEFAULT_BIND:-0.0.0.0}"             # 0.0.0.0 = reachable from the LAN; 127.0.0.1 = this Mac only
+MACVS_DEFAULT_BIND="${MACVS_DEFAULT_BIND:-127.0.0.1}"           # 127.0.0.1 = this Mac only; 0.0.0.0 = reachable from the LAN
 MACVS_DEFAULT_WEB_FORWARDS="${MACVS_DEFAULT_WEB_FORWARDS:-80:80 443:443}"  # added to every VM unless --no-web
 MACVS_DEFAULT_DAEMON="${MACVS_DEFAULT_DAEMON:-system}"          # system | agent | none: how create/import register with launchd
 MACVS_DEFAULT_SSH_PORT_BASE="${MACVS_DEFAULT_SSH_PORT_BASE:-2222}"

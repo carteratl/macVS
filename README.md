@@ -62,9 +62,10 @@ macvs destroy web --yes
 
 ### What `create` does by default
 
-- Forwards SSH (first free port from 2222) plus **80 and 443** from all of the Mac's
-  addresses to the guest. Only one VM can own a host port, so a second VM needs
-  `--no-web` (or other `--forward` values); `create` refuses conflicts up front.
+- Forwards SSH (first free port from 2222) plus **80 and 443** to the guest, bound to
+  `127.0.0.1` so only this Mac can reach them (`--bind 0.0.0.0` opens them to your LAN).
+  Only one VM can own a host port, so a second VM needs `--no-web` (or other
+  `--forward` values); `create` refuses conflicts up front.
 - Registers a **system LaunchDaemon** (sudo prompts once) so the VM boots with the Mac,
   before anyone logs in, and restarts after a crash. QEMU still runs as your user.
 - Gives the guest 2 vCPUs and 2048 MiB with a **virtio balloon**, so memory the guest
@@ -81,7 +82,7 @@ Options (defaults in parentheses; all overridable in `~/.macvs/config`):
 | `--ssh-port PORT` | host port forwarded to guest 22 (first free port from 2222) |
 | `--forward H:G` | extra TCP forward host→guest; repeatable, e.g. `--forward 8080:8080` |
 | `--no-web` | do not forward 80 and 443 |
-| `--bind ADDR` | address forwards bind to (0.0.0.0; `127.0.0.1` keeps them on this Mac) |
+| `--bind ADDR` | address forwards bind to (127.0.0.1, this Mac only; `0.0.0.0` opens them to the LAN) |
 | `--user NAME` | admin user created in the guest (admin) |
 | `--ssh-key FILE.pub` | key to authorise (your `~/.ssh/id_ed25519.pub`, else a new per-VM key) |
 | `--password` | prompt for a serial-console password; SSH stays key-only |
@@ -144,9 +145,12 @@ route by `Host` header or SNI:
 - **From the Mac itself**, add lines to `/etc/hosts`:
   `127.0.0.1  ponder.test  wiki.ponder.test`. Use IPv4 entries only; the forwards
   listen on IPv4, so a `::1` line would make browsers try IPv6 first and fail over slowly.
-- **From other machines**, point the same names at the Mac's LAN address in their hosts
-  files or in your router's DNS. The default `--bind 0.0.0.0` makes that work without
-  any other change.
+- **From other machines**, only if you want that: create the VM with `--bind 0.0.0.0`
+  and point the same names at the Mac's LAN address in their hosts files or your
+  router's DNS. With the default `127.0.0.1` binding the Mac refuses every connection
+  from the network, whatever name the client uses. Note that a hosts entry is not access
+  control: on an open binding anyone on the LAN can connect to the Mac's address and send
+  the site's name in the `Host` header or SNI themselves.
 
 Things to know:
 
@@ -179,7 +183,7 @@ Things to know:
  ~/.macvs/vms/<name>/            disk.qcow2   nvram.fd (UEFI vars)   seed.iso (cloud-init NoCloud, built by hdiutil)
                                       │            │                    │
                                       ▼            ▼                    ▼
- qemu-system-aarch64 -machine virt -accel hvf -cpu host  …  -netdev user,hostfwd=tcp:0.0.0.0:80-:80,hostfwd=…:443-:443,hostfwd=…:2222-:22
+ qemu-system-aarch64 -machine virt -accel hvf -cpu host  …  -netdev user,hostfwd=tcp:127.0.0.1:80-:80,hostfwd=…:443-:443,hostfwd=…:2222-:22
         │ virtio-balloon free-page-reporting  ──► freed guest pages returned to macOS
         │ serial ──► run/console.sock + logs/console.log
         │ QMP    ──► run/qmp.sock   (used by `stop` for a clean ACPI power-off)
@@ -261,8 +265,9 @@ QEMU user-mode networking (slirp) is used: no root, no kernel extensions, works 
 any Wi-Fi or wired network. The guest reaches the internet through NAT and sees the
 host at `10.0.2.2`. Everything else reaches the guest only through the forwarded ports.
 Add forwards at creation (`--forward 8080:8080`) or later by editing `VM_FORWARDS` in
-`vm.conf` while the VM is stopped. Forwards bind to `0.0.0.0` by default; use
-`--bind 127.0.0.1` (or set `MACVS_DEFAULT_BIND`) to keep a VM reachable only from this Mac.
+`vm.conf` while the VM is stopped. Forwards bind to `127.0.0.1` by default, so a VM is
+reachable only from this Mac; use `--bind 0.0.0.0` (or set `MACVS_DEFAULT_BIND`) to
+expose its forwarded ports to your LAN.
 
 ## Configuration
 

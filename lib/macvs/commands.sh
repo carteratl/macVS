@@ -52,7 +52,7 @@ usage_create() {
 Usage: macvs create <name> [options]
 
 By default the new server gets the web ports (${MACVS_DEFAULT_WEB_FORWARDS// /, }) and SSH forwarded
-from all of this Mac's addresses, is registered as a launchd ${MACVS_DEFAULT_DAEMON} job that
+on ${MACVS_DEFAULT_BIND} (127.0.0.1 = this Mac only), is registered as a launchd ${MACVS_DEFAULT_DAEMON} job that
 boots with the Mac, and is started right away.
 
   --cpus N             vCPUs                          (default $MACVS_DEFAULT_CPUS)

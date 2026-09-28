@@ -15,9 +15,10 @@
 # Guest admin user created by cloud-init.
 #MACVS_DEFAULT_USER=admin
 
-# Address host port-forwards bind to. 0.0.0.0 makes the VM's forwarded ports
-# reachable from other machines on your network; 127.0.0.1 keeps them on this Mac.
-#MACVS_DEFAULT_BIND=0.0.0.0
+# Address host port-forwards bind to. 127.0.0.1 keeps the VM's ports reachable only
+# from this Mac (name resolution is not access control: with 0.0.0.0 anyone on your
+# network can connect to the Mac's address and supply the site name themselves).
+#MACVS_DEFAULT_BIND=127.0.0.1
 
 # Forwards added to every new VM unless --no-web is given (host:guest, space separated).
 # Only one VM can own a host port; later VMs need --no-web or other --forward values.

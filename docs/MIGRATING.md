@@ -49,9 +49,9 @@ If it will not exit, `sudo kill <pid>` stops it the hard way; ext4 recovers, but
 
 **3. Import.** The disk and UEFI variable store are cloned into `~/.macvs/vms/<name>`
 (instant on APFS; the originals stay put as a fallback). sudo prompts once to install
-the boot-time LaunchDaemon. The default web ports 80 and 443 are forwarded on all of
-the Mac's addresses, SSH stays on 2222, and the VM boots with 2 vCPUs and 2048 MiB
-with the memory balloon.
+the boot-time LaunchDaemon. The default web ports 80 and 443 and SSH on 2222 are
+forwarded on the Mac's loopback only (add `--bind 0.0.0.0` if other machines must reach
+them), and the VM boots with 2 vCPUs and 2048 MiB with the memory balloon.
 
 ```bash
 macvs import ponder.carter.network \
