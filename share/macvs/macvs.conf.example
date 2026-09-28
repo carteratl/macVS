@@ -51,3 +51,10 @@
 # Override QEMU discovery if it is not on PATH or firmware lives elsewhere.
 #MACVS_QEMU_BIN=/opt/homebrew/bin/qemu-system-aarch64
 #MACVS_QEMU_SHARE=/opt/homebrew/share/qemu
+
+# Defaults for `macvs deploy webroot` (the guest web-server profile).
+# PHP series installed from packages.sury.org; swapfile size inside the guest
+# (or none); guest firewall: none (the Mac's port forwards are the firewall) or ufw.
+#MACVS_WEBROOT_PHP=8.5
+#MACVS_WEBROOT_SWAP=2G
+#MACVS_WEBROOT_FIREWALL=none

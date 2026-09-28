@@ -4,7 +4,7 @@
 # launchd for running it as a service. See README.md.
 set -euo pipefail
 
-MACVS_VERSION="0.3.0"
+MACVS_VERSION="0.4.0"
 
 # Find the real location of this script (follows symlinks) so lib/ can be sourced.
 _macvs_self() {
@@ -20,7 +20,7 @@ MACVS_BIN_DIR="$(_macvs_self "${BASH_SOURCE[0]}")"
 MACVS_ROOT="$(cd "$MACVS_BIN_DIR/.." && pwd)"
 MACVS_LIB="$MACVS_ROOT/lib/macvs"
 
-for _f in common image cloudinit qemu launchd commands; do
+for _f in common image cloudinit qemu launchd deploy commands; do
   # shellcheck disable=SC1090
   . "$MACVS_LIB/$_f.sh"
 done

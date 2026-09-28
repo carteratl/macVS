@@ -21,8 +21,10 @@ $ macvs create web
 Connect:  macvs ssh web
 ```
 
-Stage one of the project: it produces a clean Debian server and manages its lifecycle.
-Web stacks and other provisioning are deliberately left to you (or to a later stage).
+That is stage one: a clean Debian server with its lifecycle managed. Stage two adds
+provisioning profiles applied over SSH; the first, `macvs deploy webroot`, installs the
+web stack of the io-server project (Apache 2.4, PHP-FPM from Sury, MariaDB, certbot)
+and leaves the server ready for a site vhost and a webroot.
 
 ## Requirements
 
@@ -53,6 +55,7 @@ and leaves VM data alone.
 
 ```bash
 macvs create web                # image (once), create, register with launchd, boot, wait
+macvs deploy webroot web        # Apache + PHP-FPM + MariaDB + certbot inside it (see below)
 macvs ssh web                   # log in as 'admin' (passwordless sudo)
 macvs status web
 macvs stop web                  # clean ACPI power-off; comes back at next boot
@@ -130,6 +133,8 @@ hand-built QEMU plist.
 | `macvs logs <name> [-f] [--console\|--qemu\|--launchd]` | Tail the console, QEMU, or launchd log |
 | `macvs wait <name>` | Block until SSH answers (and cloud-init is done) |
 | `macvs reseed <name>` | Rebuild the cloud-init seed after editing `vm.conf` (VM stopped) |
+| `macvs deploy webroot <name> [opts]` | Provision the web stack inside a running VM over SSH (re-runnable) |
+| `macvs deploy list` | Available provisioning profiles |
 | `macvs daemon install <name> [--system\|--agent]` | Register with launchd (system needs sudo) |
 | `macvs daemon uninstall\|status\|plist <name>` | Manage or inspect the launchd job |
 | `macvs image pull [--refresh]` / `list` / `rm <release>` | Manage cached base images |
@@ -187,6 +192,57 @@ Things to know:
 - **Only one VM can own 80 and 443.** Additional VMs get their own high ports
   (`--no-web --forward 8081:80`), or you put a reverse proxy in the first VM.
 
+## Deploying the web stack
+
+```bash
+macvs deploy webroot web
+```
+
+`deploy webroot` turns a running VM into a web server over SSH. It ports the base
+operating-system and web-stack layers of the io-server project (its Ansible playbooks
+`10-base-os` and `30-web-stack`) to one idempotent bash script that runs as root inside
+the guest, and leaves the server ready for a site: an Apache vhost plus a webroot. It
+creates no site, database, or certificate; hosting a site is the next step and yours.
+
+| Layer | Result |
+|---|---|
+| APT | Debian deb822 sources; the Sury PHP repository with its keyring package installed and the signing key's fingerprint verified; PHP pinned to Sury, everything else to Debian |
+| Base | ca-certificates, curl, git, htop, jq, locales, logrotate, nano, needrestart, rsync, unzip and zip, zstd, acl, dnsutils and friends; `en_US.UTF-8`; the VM's timezone; security-only unattended upgrades, no automatic reboot |
+| Swap | a 2 GB `/swapfile` (`--swap 1G`, `--swap none`), swappiness 10 |
+| Apache 2.4 | event MPM with the reviewed module set (proxy_fcgi, http2, ssl, brotli, deflate, headers, expires, rewrite, …); hardening (`ServerTokens Prod`, `.git` never served, `X-Content-Type-Options`, TLS 1.2 and 1.3 only, `/var/www` without indexes or foreign symlinks); Brotli or gzip compression and static-asset caching with WordPress admin, login, API and feed paths never cached; a default-deny vhost on 80 and 443 (self-signed placeholder certificate) so any name no site claims gets 403 |
+| PHP-FPM | `php8.5-fpm` and the WordPress extension set from Sury (`--php 8.4` for another series); FPM only, no mod_php; io's limits (64M uploads, 256M memory, 300 s), OPcache tuned; the `www` pool on `/run/php/php8.5-fpm.sock` |
+| MariaDB | bound to `127.0.0.1` with io's buffer-pool and connection limits; root through the unix socket (`sudo mariadb`) |
+| certbot | with the Apache plugin, the renewal timer, and a deploy hook that reloads Apache (`--dns-plugin cloudflare` adds a DNS-01 plugin, `--no-certbot` skips it) |
+| Record | `/etc/macvs/webroot.env` and a MOTD in the guest, `profiles webroot` in `macvs status`, the run's output in `~/.macvs/vms/<name>/logs/deploy-webroot.log` |
+
+Sizing follows io-server's role policy: a guest with 3.5 GB or more gets its 4 GB
+column (512M InnoDB buffer pool, 40 connections, 12 FPM processes, 256M OPcache); the
+default 2 GiB VM gets the 1 GB column (256M, 30, 6, 128M).
+
+**Firewall.** Nothing is installed in the guest by default, and that is deliberate.
+The VM sits behind QEMU's user-mode NAT: the only traffic that can reach it arrives on
+the ports macvs forwards, and every client, the Mac included, appears to the guest as
+`10.0.2.2`. A guest firewall therefore cannot tell clients apart, and fail2ban, which
+io-server runs on its internet-facing host, would ban `10.0.2.2` after five bad SSH
+attempts and lock everyone out at once. The forward list on the Mac, bound to
+`127.0.0.1`, is the firewall. `--firewall ufw` installs UFW anyway if you want belt and
+braces: it allows exactly SSH plus the guest ports this VM forwards (`22 80 443` by
+default) and denies everything else inbound; the profile owns the rule set.
+
+**After it finishes.** Print a vhost to start from with
+`macvs deploy webroot --example your.site.tld`: it uses `/var/www/your.site.tld/htdocs`,
+the FPM socket, and the Let's Encrypt paths, with the steps as comments. Then, inside
+the guest, get a certificate (`certbot certonly --dns-<provider> -d your.site.tld`),
+`a2ensite` the vhost, and add the name to `/etc/hosts` on the Mac as described above.
+
+Re-running `macvs deploy webroot <name>` converges: it rewrites only managed files that
+differ and restarts only services whose configuration changed, so it is also how you
+change options later (`--php`, `--swap`, `--firewall`). `--print` shows the exact script
+and parameters before anything runs. It works on Debian 13 guests (Debian 12 is
+accepted with a warning), created or imported, as long as the SSH user can `sudo`
+without a password. Defaults live in `~/.macvs/config` (`MACVS_WEBROOT_PHP`,
+`MACVS_WEBROOT_SWAP`, `MACVS_WEBROOT_FIREWALL`).
+
 ## How it works
 
 ```
@@ -232,12 +288,12 @@ Things to know:
 ├── config                      optional overrides (see share/macvs/macvs.conf.example)
 ├── images/<release>/           cached base image, its .sha512, and SHA512SUMS
 └── vms/<name>/
-    ├── vm.conf                 the VM's settings (shell key=value; edit while stopped)
+    ├── vm.conf                 the VM's settings (shell key=value; edit while stopped; VM_PROFILES lists applied profiles)
     ├── disk.qcow2  nvram.fd  [seed.iso]
     ├── cloud-init/user-data, meta-data      (created VMs only)
     ├── ssh/known_hosts [id_ed25519 if a key was generated]
     ├── run/qemu.pid, qmp.sock, console.sock
-    └── logs/console.log, qemu.log, launchd.log
+    └── logs/console.log, qemu.log, launchd.log, deploy-<profile>.log
 ```
 
 Set `MACVS_HOME` to relocate all of it. Keep it out of `~/Documents`, `~/Desktop`, and
@@ -326,9 +382,9 @@ forever), and use `macvs import` to adopt the existing disk.
 
 ## Roadmap
 
-Later stages: provisioning profiles layered on the blank server (web stack, TLS with a
-private CA), a vmnet option for VMs that need their own LAN address, snapshots, and
-`macvs hosts` to manage the `/etc/hosts` entries for internal sites.
+Later stages: a site profile on top of `webroot` (site user, FPM pool, database, vhost,
+certificate, WordPress), a vmnet option for VMs that need their own LAN address,
+snapshots, and `macvs hosts` to manage the `/etc/hosts` entries for internal sites.
 
 ## Repository layout
 
@@ -339,8 +395,11 @@ lib/macvs/image.sh        Debian cloud image download and SHA-512 verification
 lib/macvs/cloudinit.sh    user-data / meta-data and the cidata ISO (hdiutil)
 lib/macvs/qemu.sh         QEMU arguments, start/stop, QMP, SSH, serial console
 lib/macvs/launchd.sh      plist generation, install/uninstall, autostart, kickstart
+lib/macvs/deploy.sh       provisioning profiles: send a guest script over SSH, run it as root
 lib/macvs/commands.sh     command implementations and dispatch
 share/macvs/macvs.conf.example
+share/macvs/deploy/webroot.sh                 the guest-side web-stack profile (bash, idempotent)
+share/macvs/deploy/webroot-example-vhost.conf printed by `deploy webroot --example`
 docs/MIGRATING.md         adopting a hand-built QEMU VM
 install.sh
 ```
