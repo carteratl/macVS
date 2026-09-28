@@ -150,15 +150,19 @@ route by `Host` header or SNI:
 
 Things to know:
 
-- **Pick names under a reserved or owned domain.** `.test`, `.internal`, and `.home.arpa`
-  are reserved for exactly this; subdomains of a domain you own also work and can even
-  get real certificates. Avoid real public TLDs you do not own. In particular `.foo`,
-  `.dev`, `.app`, and `.page` are on browsers' HSTS preload list, so `http://ponder.foo`
-  is silently upgraded to HTTPS and refuses to load until the guest serves a certificate
-  the Mac trusts. Avoid `.local` too; macOS reserves it for Bonjour.
-- **HTTPS needs a trusted certificate** either way: a small private CA (for example
-  `mkcert`) whose root you install on the Mac and other clients, or Let's Encrypt via
-  DNS validation if the names live under a domain you own.
+- **Use names you own and real certificates.** The best setup is a domain you have
+  registered, with Let's Encrypt certificates issued by certbot inside the guest. TLDs on
+  browsers' HSTS preload list such as `.foo`, `.dev`, `.app`, and `.page` are a good fit:
+  browsers insist on HTTPS for them, and with a valid certificate that is exactly what you
+  want. Nothing on the clients needs configuring beyond the name resolution above.
+- **Getting certificates from inside the VM.** Outbound traffic works through the NAT, so
+  certbot's DNS-01 challenge (your DNS provider's API plugin) needs no inbound access at
+  all and suits internal-only sites. HTTP-01 also works if your router forwards port 80
+  to the Mac, because macvs already forwards 80 on to the guest. Certbot's renewal timer
+  runs inside the guest unchanged.
+- **Names you do not own** belong under a reserved TLD such as `.test`, `.internal`, or
+  `.home.arpa`, with a private CA (for example `mkcert`) whose root the clients trust.
+  Avoid `.local`; macOS reserves it for Bonjour.
 - **The guest sees every client as `10.0.2.2`.** User-mode networking hides real client
   addresses, so access logs and IP-based rules inside the guest cannot tell clients apart.
   Giving the VM its own LAN address needs Apple's vmnet, which requires QEMU to run as
