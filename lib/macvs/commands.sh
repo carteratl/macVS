@@ -156,6 +156,15 @@ resolve_ports() {
   fi
   # shellcheck disable=SC2086
   OPT_FORWARDS="$(printf '%s\n' $OPT_FORWARDS | sort -u | tr '\n' ' ' | sed 's/ *$//')"
+  # Privileged ports on a specific address are served through a relay port; it must be free too.
+  local h r owner
+  for h in "$OPT_SSH_PORT" $(for f in $OPT_FORWARDS; do printf '%s\n' "${f%%:*}"; done); do
+    forward_needs_relay "$h" "$OPT_BIND" || continue
+    r="$(relay_port "$h")"
+    if owner="$(port_used_by_vm "$r")"; then die "relay port $r (for $h) is already assigned to VM '$owner'"; fi
+    if port_listening "$r"; then die "relay port $r (for $h) is already in use on this Mac"; fi
+  done
+  return 0
 }
 
 # Register with launchd (or not), wait for the guest, print how to connect.
@@ -455,7 +464,13 @@ cmd_status() {
   printf '  resources  %s vCPU, %s MiB RAM%s, %s disk (%s used)\n' "$VM_CPUS" "$VM_MEMORY" \
     "$([ "$VM_BALLOON" = on ] && echo ' (balloon)')" "$VM_DISK" "${disk_used:-?}"
   printf '  ssh        %s@%s -p %s\n' "$VM_USER" "$VM_SSH_HOST" "$VM_SSH_PORT"
-  for f in $VM_FORWARDS; do printf '  forward    %s:%s -> guest:%s\n' "$VM_BIND" "${f%%:*}" "${f##*:}"; done
+  for f in $VM_FORWARDS; do
+    if forward_needs_relay "${f%%:*}" "$VM_BIND"; then
+      printf '  forward    %s:%s -> guest:%s  (relay via %s: %s)\n' "$VM_BIND" "${f%%:*}" "${f##*:}" "$(relay_port "${f%%:*}")" "$(relay_state "${f%%:*}")"
+    else
+      printf '  forward    %s:%s -> guest:%s\n' "$VM_BIND" "${f%%:*}" "${f##*:}"
+    fi
+  done
   printf '  bind       %s\n' "$VM_BIND"
   printf '  launchd    %s\n' "$kind"
   printf '  files      %s\n' "$VM_DIR"
@@ -555,7 +570,10 @@ cmd_daemon() {
       kind="$(launchd_kind "$VM_NAME")"
       [ -n "$kind" ] || { echo "no launchd job for $VM_NAME"; return 0; }
       printf 'kind:       %s\nlabel:      %s\nplist:      %s\nstate:      %s\nautostart:  %s\n' "$kind" "$(launchd_label "$VM_NAME")" \
-        "$(launchd_plist_path "$VM_NAME" "$kind")" "$(launchd_state "$VM_NAME" || echo 'not loaded')" "$VM_AUTOSTART" ;;
+        "$(launchd_plist_path "$VM_NAME" "$kind")" "$(launchd_state "$VM_NAME" || echo 'not loaded')" "$VM_AUTOSTART"
+      for a in $(vm_relayed_ports); do
+        printf 'relay:      %s:%s -> %s  %s  (%s)\n' "$VM_BIND" "$a" "$(relay_port "$a")" "$(relay_state "$a")" "$(relay_label "$VM_NAME" "$a")"
+      done ;;
     plist)
       [ -n "$name" ] || die "usage: macvs daemon plist <name> [--system|--agent]"
       load_vm "$name"; qemu_detect; launchd_render_plist "${kind:-system}" ;;
@@ -617,6 +635,7 @@ cmd_doctor() {
     elif port_listening "$t"; then note "host port $t" "in use by something else on this Mac; new VMs need --no-web or --forward"
     else note "host port $t" "free"; fi
   done
+  note "privileged ports" "on $MACVS_DEFAULT_BIND ports below 1024 are served via launchd relays (bound as $MACVS_RELAY_BASE+port)"
   if password_hash x >/dev/null 2>&1; then check "openssl passwd -6 (optional)" 0 "available for --password"
   else note "openssl passwd -6 (optional)" "brew install openssl@3 to use --password"; fi
   if sudo -n true 2>/dev/null; then note "sudo" "passwordless"; else note "sudo" "will prompt when installing a system LaunchDaemon"; fi

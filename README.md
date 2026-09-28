@@ -136,6 +136,19 @@ hand-built QEMU plist.
 | `macvs doctor` | Check the Mac, including whether the web ports are free |
 | `macvs run <name>` | Run QEMU in the foreground (this is what launchd executes) |
 
+## Privileged ports on the loopback address
+
+macOS lets a non-root process bind a port below 1024 only on the wildcard address.
+On a specific address such as the default `127.0.0.1`, QEMU gets "permission denied"
+for 80 and 443. macvs therefore has QEMU bind those forwards on a relay port
+(`40000 + port`, so 40080 and 40443) and installs one small launchd job per privileged
+port next to the VM's job. launchd itself, which may bind anything, owns
+`127.0.0.1:443`; for each accepted connection it runs `nc` as your user to relay the
+bytes to 40443. Nothing but launchd is privileged, TLS passes through untouched, and
+the relays are created and removed together with the VM's job. `macvs status` shows
+each relay; a VM started without a launchd job serves those ports only on the relay
+ports until `macvs daemon install`. With `--bind 0.0.0.0` no relay is needed.
+
 ## Hosting internal websites
 
 The intended pattern is one VM that owns ports 80 and 443 on the Mac, with the sites
@@ -197,8 +210,12 @@ Things to know:
    picks up a newer upstream build.
 2. **Disk.** The verified image is cloned (instant on APFS, no backing-file dependency)
    and resized to `--disk`. Debian's cloud image grows its root filesystem on first boot.
-3. **Firmware.** Each VM gets its own copy of the EDK2 UEFI variable store; the read-only
-   firmware code comes from the QEMU installation.
+3. **Firmware and devices.** Each VM gets its own copy of the EDK2 UEFI variable store;
+   the read-only firmware code comes from the QEMU installation. PCI slots are pinned
+   (NIC 1, disk 2, seed 3, balloon 4, rng 5) so the guest's interface name, `enp0s1`,
+   never changes when devices are added. That is also the layout a classic
+   `-drive if=virtio … -device virtio-net-pci` command line produces, so hand-built
+   VMs import with their network configuration intact.
 4. **First boot.** A tiny ISO labelled `cidata` carries `user-data` and `meta-data`.
    cloud-init sets the hostname, creates the admin user with your SSH key and
    passwordless sudo, disables root and SSH password login, sets the timezone, and
@@ -292,6 +309,12 @@ forever), and use `macvs import` to adopt the existing disk.
   messages; `--launchd` the service log.
 - **`host port 443 is already in use`.** Something on the Mac (another VM, Apache,
   a dev server) owns it. Pass `--no-web`, or free the port.
+- **`Could not set up host forwarding rule 'tcp:127.0.0.1:80-:80'`.** An older macvs
+  bound privileged ports directly; upgrade, and run `macvs daemon install <name>` so the
+  relays are created.
+- **Imported guest has no network.** Its interface name changed. macvs pins the NIC to
+  PCI slot 1 (`enp0s1`), matching the usual hand-built layout; a VM built with a
+  different layout needs its `/etc/network/interfaces` updated from the serial console.
 - **SSH never comes up.** Look at `macvs logs <name>`. For imports, check that the
   guest actually runs sshd on port 22 and that `--user`/`--ssh-key` match.
 - **`Operation not permitted` in launchd.log.** The job points at a script inside a folder

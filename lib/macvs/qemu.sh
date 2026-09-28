@@ -31,31 +31,45 @@ hvf_available() { [ "$(sysctl -n kern.hv_support 2>/dev/null)" = 1 ]; }
 # ---------------------------------------------------------------------------
 # Command line
 # ---------------------------------------------------------------------------
+# The host port QEMU actually binds for a forward. Ports below 1024 on a specific
+# address (the default 127.0.0.1) cannot be bound by a non-root process on macOS, so
+# those are bound on a relay port and a launchd job owns the real port (see launchd.sh).
+host_bind_port() { # hostport
+  if forward_needs_relay "$1" "$VM_BIND"; then relay_port "$1"; else printf '%s\n' "$1"; fi
+}
+
 qemu_build_args() {
   local net f
-  net="user,id=net0,hostfwd=tcp:${VM_BIND}:${VM_SSH_PORT}-:22"
+  net="user,id=net0,hostfwd=tcp:${VM_BIND}:$(host_bind_port "$VM_SSH_PORT")-:22"
   for f in $VM_FORWARDS; do
-    net="$net,hostfwd=tcp:${VM_BIND}:${f%%:*}-:${f##*:}"
+    net="$net,hostfwd=tcp:${VM_BIND}:$(host_bind_port "${f%%:*}")-:${f##*:}"
   done
+  # PCI slots are pinned so guest interface names never change when devices are
+  # added. NIC in slot 1 (enp0s1) and disk in slot 2 reproduce what the classic
+  # "-drive if=virtio ... -device virtio-net-pci" command line yields (explicit
+  # -device arguments are realised before the if=virtio disk), so hand-built VMs
+  # import without touching their network configuration. Seed 3, balloon 4, rng 5.
   QEMU_ARGS=(
     -name "$VM_NAME"
     -machine "$VM_MACHINE" -accel hvf -cpu host
     -smp "$VM_CPUS" -m "$VM_MEMORY"
     -drive "if=pflash,format=raw,readonly=on,file=$MACVS_FW_CODE"
     -drive "if=pflash,format=raw,file=$VM_NVRAM_PATH"
-    -drive "file=$VM_DISK_PATH,if=virtio,format=qcow2,cache=$VM_DISK_CACHE,discard=unmap"
+    -drive "file=$VM_DISK_PATH,if=none,id=disk0,format=qcow2,cache=$VM_DISK_CACHE,discard=unmap"
+    -device "virtio-net-pci,netdev=net0,addr=0x1"
+    -device "virtio-blk-pci,drive=disk0,addr=0x2"
+    -netdev "$net"
   )
   if [ "$VM_PROVISION" = cloud-init ]; then
-    QEMU_ARGS+=(-drive "file=$VM_SEED_PATH,if=virtio,format=raw,readonly=on")
+    QEMU_ARGS+=(-drive "file=$VM_SEED_PATH,if=none,id=seed0,format=raw,readonly=on"
+                -device "virtio-blk-pci,drive=seed0,addr=0x3")
   fi
   if [ "$VM_BALLOON" = on ]; then
     # Guest hands freed pages back to macOS within seconds instead of pinning them.
-    QEMU_ARGS+=(-device virtio-balloon-pci,free-page-reporting=on,deflate-on-oom=on)
+    QEMU_ARGS+=(-device "virtio-balloon-pci,free-page-reporting=on,deflate-on-oom=on,addr=0x4")
   fi
   QEMU_ARGS+=(
-    -device virtio-net-pci,netdev=net0
-    -netdev "$net"
-    -device virtio-rng-pci
+    -device "virtio-rng-pci,addr=0x5"
     -chardev "socket,id=con0,path=$VM_CONSOLE_SOCK,server=on,wait=off,logfile=$VM_CONSOLE_LOG,logappend=on"
     -serial chardev:con0
     -qmp "unix:$VM_QMP_SOCK,server=on,wait=off"
@@ -132,6 +146,19 @@ vm_start_direct() {
   sleep 1
   pid="$(vm_pid)" || die "QEMU exited immediately after start (see $VM_QEMU_LOG and $VM_CONSOLE_LOG)"
   ok "$VM_NAME running (pid $pid)"
+  if [ -z "$(launchd_kind "$VM_NAME")" ] && [ -n "$(vm_relayed_ports)" ]; then
+    warn "no launchd job, so the relays for port(s) $(vm_relayed_ports | tr '\n' ' ')are not running;" \
+         "reach them on $(vm_relayed_ports | while read -r p; do printf '%s ' "$(relay_port "$p")"; done)until 'macvs daemon install $VM_NAME'"
+  fi
+}
+
+# Host ports of this VM that need a launchd relay (one per line).
+vm_relayed_ports() {
+  local f p
+  for p in "$VM_SSH_PORT" $(for f in $VM_FORWARDS; do printf '%s\n' "${f%%:*}"; done); do
+    forward_needs_relay "$p" "$VM_BIND" && printf '%s\n' "$p"
+  done
+  return 0
 }
 
 # Foreground run used by launchd. QEMU is a child so that SIGTERM/SIGINT from

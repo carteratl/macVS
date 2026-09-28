@@ -64,6 +64,10 @@ macvs import ponder.carter.network \
 Add `--cache writethrough` if you want to keep the old script's slower but crash-safer
 disk mode, and `--forward` for any extra ports the old script forwarded.
 
+If the import itself succeeded but registering the launchd job failed, the VM still
+exists: fix the cause and run `macvs daemon install ponder.carter.network` rather than
+importing again.
+
 **4. Verify.**
 
 ```bash
@@ -72,6 +76,9 @@ ssh -p 2222 josh@localhost
 curl -k https://localhost/
 macvs logs ponder.carter.network
 ```
+
+`status` lists the relays launchd runs for 80 and 443 (see the README on privileged
+ports). Inside the guest, `systemctl --failed` shows anything that did not come up.
 
 **5. Optional: key-based login** so `macvs ssh` works without a password prompt.
 

@@ -175,9 +175,12 @@ launchd_install() { # kind
     tail -n 5 "$VM_LAUNCHD_LOG" >&2 || true
     launchd_sudo "$kind" launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
     launchd_sudo "$kind" rm -f "$plist"
+    launchd_uninstall_relays "$kind"
     exit 1
   fi
   ok "$VM_NAME is now managed by launchd ($kind): label $label, pid $(vm_pid)"
+  launchd_uninstall_relays "$kind"   # drop relays for ports the VM no longer has
+  launchd_install_relays "$kind"
 }
 
 launchd_uninstall() {
@@ -189,6 +192,7 @@ launchd_uninstall() {
   domain="$(launchd_domain "$kind")"
   if vm_is_running; then vm_stop; fi
   [ "$kind" = system ] && info "removing LaunchDaemon (sudo will prompt for your password)"
+  launchd_uninstall_relays "$kind"
   launchd_sudo "$kind" launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
   launchd_sudo "$kind" rm -f "$plist"
   ok "removed launchd job for $VM_NAME ($kind)"
@@ -228,4 +232,109 @@ launchd_kickstart() {
   domain="$(launchd_domain "$kind")"
   [ "$kind" = system ] && info "starting via launchd (sudo may prompt for your password)"
   launchd_sudo "$kind" launchctl kickstart "$domain/$label" || die "launchctl kickstart failed"
+}
+
+# ---------------------------------------------------------------------------
+# Relays for privileged ports on a specific address.
+# launchd (pid 1) may bind any port, so a small inetd-style job owns e.g.
+# 127.0.0.1:443 and hands each accepted connection to `nc`, which relays it to the
+# port QEMU could bind (MACVS_RELAY_BASE+443). nc runs as your user; nothing else
+# is privileged. Relays live and die with the VM's launchd job.
+# ---------------------------------------------------------------------------
+relay_label() { printf '%s.%s.relay%s\n' "$MACVS_LAUNCHD_PREFIX" "$1" "$2"; }   # name port
+
+relay_plist_path() { # name port kind
+  case "$3" in
+    system) printf '/Library/LaunchDaemons/%s.plist\n' "$(relay_label "$1" "$2")" ;;
+    agent)  printf '%s/Library/LaunchAgents/%s.plist\n' "$HOME" "$(relay_label "$1" "$2")" ;;
+  esac
+}
+
+relay_render_plist() { # port kind  (uses VM_* vars)
+  local port="$1" kind="$2"
+  cat <<EOT
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$(xml_escape "$(relay_label "$VM_NAME" "$port")")</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/nc</string>
+    <string>$(xml_escape "$VM_BIND")</string>
+    <string>$(relay_port "$port")</string>
+  </array>
+  <key>Sockets</key>
+  <dict>
+    <key>Listeners</key>
+    <dict>
+      <key>SockNodeName</key>
+      <string>$(xml_escape "$VM_BIND")</string>
+      <key>SockServiceName</key>
+      <string>$port</string>
+      <key>SockType</key>
+      <string>stream</string>
+      <key>SockFamily</key>
+      <string>IPv4</string>
+    </dict>
+  </dict>
+  <key>inetdCompatibility</key>
+  <dict>
+    <key>Wait</key>
+    <false/>
+  </dict>
+EOT
+  if [ "$kind" = system ]; then
+    cat <<EOT
+  <key>UserName</key>
+  <string>$(id -un)</string>
+  <key>GroupName</key>
+  <string>$(id -gn)</string>
+EOT
+  fi
+  cat <<EOT
+  <key>StandardErrorPath</key>
+  <string>$(xml_escape "$VM_LOG_DIR/relay.log")</string>
+</dict>
+</plist>
+EOT
+}
+
+launchd_install_relays() { # kind
+  local kind="$1" domain p plist tmp label
+  domain="$(launchd_domain "$kind")"
+  for p in $(vm_relayed_ports); do
+    label="$(relay_label "$VM_NAME" "$p")"
+    plist="$(relay_plist_path "$VM_NAME" "$p" "$kind")"
+    tmp="$(mktemp -t macvs-relay)"
+    relay_render_plist "$p" "$kind" > "$tmp"
+    plutil -lint -s "$tmp" >/dev/null || { rm -f "$tmp"; die "generated relay plist failed validation"; }
+    if [ "$kind" = system ]; then sudo install -o root -g wheel -m 0644 "$tmp" "$plist"
+    else install -m 0644 "$tmp" "$plist"; fi
+    rm -f "$tmp"
+    launchd_sudo "$kind" launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
+    launchd_sudo "$kind" launchctl bootstrap "$domain" "$plist" || die "launchctl bootstrap failed for the port $p relay"
+    ok "relay: ${VM_BIND}:$p -> $(relay_port "$p") (launchd owns the privileged port)"
+  done
+}
+
+launchd_uninstall_relays() { # kind
+  local kind="$1" domain f label dir
+  domain="$(launchd_domain "$kind")"
+  case "$kind" in system) dir=/Library/LaunchDaemons ;; agent) dir="$HOME/Library/LaunchAgents" ;; *) return 0 ;; esac
+  for f in "$dir/$(launchd_label "$VM_NAME")".relay*.plist; do
+    [ -f "$f" ] || continue
+    label="$(basename "$f" .plist)"
+    launchd_sudo "$kind" launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
+    launchd_sudo "$kind" rm -f "$f"
+  done
+}
+
+# "listening" if the relay job is loaded, "not installed" otherwise.
+relay_state() { # port
+  local kind; kind="$(launchd_kind "$VM_NAME")"
+  [ -n "$kind" ] || { echo "not installed"; return 0; }
+  if launchctl print "$(launchd_domain "$kind")/$(relay_label "$VM_NAME" "$1")" >/dev/null 2>&1; then echo listening
+  else echo "not installed"; fi
 }

@@ -25,6 +25,7 @@ MACVS_DEFAULT_DISK_CACHE="${MACVS_DEFAULT_DISK_CACHE:-writeback}"
 MACVS_IMAGE_BASE_URL="${MACVS_IMAGE_BASE_URL:-https://cloud.debian.org/images/cloud}"
 MACVS_LAUNCHD_PREFIX="${MACVS_LAUNCHD_PREFIX:-com.carteratl.macvs}"
 MACVS_STOP_TIMEOUT="${MACVS_STOP_TIMEOUT:-90}"                  # seconds to wait for ACPI shutdown
+MACVS_RELAY_BASE="${MACVS_RELAY_BASE:-40000}"                   # privileged port P is bound as RELAY_BASE+P and relayed
 MACVS_SSH_TIMEOUT="${MACVS_SSH_TIMEOUT:-300}"                   # seconds to wait for first SSH
 
 # ---------------------------------------------------------------------------
@@ -198,8 +199,11 @@ port_used_by_vm() {
   for d in "$MACVS_HOME"/vms/*/; do
     [ -f "$d/vm.conf" ] || continue
     if ( . "$d/vm.conf"
-         [ "${VM_SSH_PORT:-}" = "$p" ] && exit 0
-         for f in ${VM_FORWARDS:-}; do [ "${f%%:*}" = "$p" ] && exit 0; done
+         b="${VM_BIND:-$MACVS_DEFAULT_BIND}"
+         for h in "${VM_SSH_PORT:-0}" $(for f in ${VM_FORWARDS:-}; do printf '%s\n' "${f%%:*}"; done); do
+           [ "$h" = "$p" ] && exit 0
+           forward_needs_relay "$h" "$b" && [ "$(relay_port "$h")" = "$p" ] && exit 0
+         done
          exit 1 ); then
       basename "$d"
       return 0
@@ -207,6 +211,15 @@ port_used_by_vm() {
   done
   return 1
 }
+
+# macOS lets non-root processes bind ports below 1024 only on the wildcard address.
+# On a specific address (the default 127.0.0.1) QEMU gets EACCES, so such forwards
+# are bound on MACVS_RELAY_BASE+port and launchd (which may bind anything) relays
+# the real port to it.
+forward_needs_relay() { # hostport bind
+  [ "$1" -lt 1024 ] && [ "$2" != 0.0.0.0 ]
+}
+relay_port() { printf '%s\n' $((MACVS_RELAY_BASE + $1)); }
 
 pick_free_port() {
   local p="$1"
