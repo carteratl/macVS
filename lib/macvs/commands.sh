@@ -30,6 +30,7 @@ Inspect and connect
 
 Provisioning (inside a running VM, over SSH)
   deploy webroot <name> [options]   Web server: base tools, Apache, PHP-FPM, MariaDB, certbot (deploy webroot --help)
+  deploy website <fqdn> <name>      A site on it: user, PHP-FPM pool, vhost, Hello World, database (deploy website --help)
   deploy list                       Available profiles
 
 Deployment
@@ -267,7 +268,7 @@ cmd_create() {
   VM_DISK="$disk"; VM_DISK_CACHE="$OPT_CACHE"; VM_MACHINE=virt; VM_BIND="$OPT_BIND"; VM_SSH_PORT="$OPT_SSH_PORT"
   VM_FORWARDS="$OPT_FORWARDS"; VM_USER="$OPT_USER"; VM_SSH_PUBKEY="$sshkey"; VM_SSH_IDENTITY="$identity"
   VM_TIMEZONE="${tz:-$(host_timezone)}"; VM_PASSWORD_HASH="$hash"; VM_EXTRA_ARGS=""
-  VM_PROVISION=cloud-init; VM_BALLOON="$OPT_BALLOON"; VM_AUTOSTART=on; VM_ORIGIN=""; VM_PROFILES=""
+  VM_PROVISION=cloud-init; VM_BALLOON="$OPT_BALLOON"; VM_AUTOSTART=on; VM_ORIGIN=""; VM_PROFILES=""; VM_SITES=""
   save_vm_conf
   load_vm "$name"
 
@@ -351,7 +352,7 @@ cmd_import() {
   VM_SSH_PORT="$OPT_SSH_PORT"; VM_FORWARDS="$OPT_FORWARDS"; VM_USER="$OPT_USER"
   VM_SSH_PUBKEY="$pubkey"; VM_SSH_IDENTITY="$identity"; VM_TIMEZONE=""; VM_PASSWORD_HASH=""
   VM_EXTRA_ARGS=""; VM_PROVISION=none; VM_BALLOON="$OPT_BALLOON"; VM_AUTOSTART=on
-  VM_ORIGIN="$(resolve_path "$src_disk")"; VM_PROFILES=""
+  VM_ORIGIN="$(resolve_path "$src_disk")"; VM_PROFILES=""; VM_SITES=""
   save_vm_conf
   load_vm "$name"
 
@@ -478,6 +479,7 @@ cmd_status() {
   printf '  bind       %s\n' "$VM_BIND"
   printf '  launchd    %s\n' "$kind"
   if [ -n "$VM_PROFILES" ]; then printf '  profiles   %s\n' "$VM_PROFILES"; fi
+  if [ -n "$VM_SITES" ]; then printf '  sites      %s\n' "$VM_SITES"; fi
   printf '  files      %s\n' "$VM_DIR"
 }
 

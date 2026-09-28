@@ -26,7 +26,32 @@ after changing options or to repair the guest.
 Profiles:
 $(deploy_list | tail -n +2 | sed 's/^/  /')
 
-Try: macvs deploy webroot --help
+Try: macvs deploy webroot --help, macvs deploy website --help
+EOT
+}
+
+usage_deploy_website() {
+  cat <<EOT
+Usage: macvs deploy website <fqdn> <name> [options]
+
+Creates a site on a VM provisioned by 'deploy webroot': a locked Linux user,
+/var/www/<fqdn>/htdocs with a Hello World page, a dedicated PHP-FPM pool on its
+own socket, one Apache vhost for the name (a domain or a subdomain), a MariaDB
+database with a root-only credentials file, and log rotation. HTTPS is enabled
+when a certificate exists in the guest (see --self-signed and --cert). Re-run to
+converge, for example after certbot issued the certificate. Nothing outside the
+guest is changed: add the name to /etc/hosts on this Mac yourself.
+
+  --alias NAME         Extra name served by the same site (repeatable, e.g. www.site.foo)
+  --self-signed        Serve HTTPS with a generated self-signed certificate (browsers warn;
+                       HSTS-preloaded TLDs such as .foo refuse it, use certbot there)
+  --cert FILE          Certificate (fullchain) and key to use, as paths inside the guest
+  --key FILE
+  --http-only          Never enable HTTPS, even if a certificate exists
+  --no-database        Do not create a MariaDB database and user
+  --remove             Take the site down: vhost and pool go; files, user, database stay
+  --purge              With --remove: also delete /var/www/<fqdn>, logs, secrets, database, user
+  --print              Show the guest script and its parameters instead of running them
 EOT
 }
 
@@ -197,11 +222,133 @@ EOT
 }
 
 # ---------------------------------------------------------------------------
+# website
+# ---------------------------------------------------------------------------
+HOST_NAME_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$'
+
+# The host port that reaches guest port $1 from this Mac right now (the relay
+# port when the privileged-port relay is not installed), or nothing.
+deploy_reach_port() { # guestport
+  local f h
+  for f in $VM_FORWARDS; do
+    [ "${f##*:}" = "$1" ] || continue
+    h="${f%%:*}"
+    if forward_needs_relay "$h" "$VM_BIND" && [ "$(relay_state "$h")" != listening ]; then relay_port "$h"; else printf '%s\n' "$h"; fi
+    return 0
+  done
+  return 1
+}
+
+deploy_website() {
+  local a b fqdn="" name="" aliases="" tls=auto cert="" key="" database=yes action=apply print="" p remove="" purge=""
+  local -a pos=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)      usage_deploy_website; return 0 ;;
+      --alias)        aliases="$aliases $(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
+      --self-signed)  tls=self-signed; shift ;;
+      --cert)         cert="$2"; tls=custom; shift 2 ;;
+      --key)          key="$2"; tls=custom; shift 2 ;;
+      --http-only)    tls=none; shift ;;
+      --no-database)  database=no; shift ;;
+      --remove)       remove=1; shift ;;
+      --purge)        purge=1; shift ;;
+      --print)        print=1; shift ;;
+      -*) die "unknown option for deploy website: $1 (try: macvs deploy website --help)" ;;
+      *)  pos+=("$1"); shift ;;
+    esac
+  done
+  [ "${#pos[@]}" -eq 2 ] || { usage_deploy_website; die "a site name and a VM name are required"; }
+  # Accept the two names in either order: whichever one is a VM is the VM.
+  a="${pos[0]}"; b="${pos[1]}"
+  if [[ "$b" =~ $NAME_RE ]] && vm_exists "$b"; then name="$b"; fqdn="$a"
+  elif [[ "$a" =~ $NAME_RE ]] && vm_exists "$a"; then name="$a"; fqdn="$b"
+  else die "neither '$a' nor '$b' is a VM (see: macvs list)"; fi
+  fqdn="$(printf '%s' "$fqdn" | tr '[:upper:]' '[:lower:]')"
+  [[ "$fqdn" =~ $HOST_NAME_RE ]] && [ "${#fqdn}" -le 253 ] || die "'$fqdn' is not a host name like site.foo or sub.site.foo"
+  for p in $aliases; do [[ "$p" =~ $HOST_NAME_RE ]] || die "alias '$p' is not a valid host name"; done
+  aliases="${aliases# }"
+  if [ "$tls" = custom ]; then [ -n "$cert" ] && [ -n "$key" ] || die "--cert and --key go together (paths inside the guest)"; fi
+  if [ -n "$purge" ] && [ -z "$remove" ]; then die "--purge only makes sense with --remove"; fi
+  if [ -n "$purge" ]; then action=purge; elif [ -n "$remove" ]; then action=remove; fi
+
+  load_vm "$name"
+  set -- "MACVS_SITE_FQDN=$fqdn" "MACVS_SITE_ALIASES=$aliases" "MACVS_SITE_TLS=$tls" "MACVS_SITE_CERT=$cert" \
+         "MACVS_SITE_KEY=$key" "MACVS_SITE_DATABASE=$database" "MACVS_SITE_ACTION=$action" "MACVS_SITE_VERSION=$MACVS_VERSION"
+  if [ -n "$print" ]; then
+    printf '# would run inside %s as root, with:\n' "$VM_NAME"
+    for p in "$@"; do printf '#   %s\n' "$p"; done
+    printf '# --- %s ---\n' "$(deploy_script website)"
+    cat "$(deploy_script website)"
+    return 0
+  fi
+  case " $VM_PROFILES " in *" webroot "*) ;; *)
+    warn "$VM_NAME has no 'webroot' profile recorded; the guest must have been provisioned by 'macvs deploy webroot $VM_NAME'" ;;
+  esac
+  deploy_preflight
+  if ! deploy_run website "$@"; then
+    echo >&2
+    die "the website profile failed in $VM_NAME; see the output above and $VM_LOG_DIR/deploy-website.log"
+  fi
+
+  local sites="" s hp hps url_http url_https tls_source
+  for s in $VM_SITES; do [ "$s" = "$fqdn" ] || sites="${sites:+$sites }$s"; done
+  if [ "$action" = apply ]; then sites="${sites:+$sites }$fqdn"; fi
+  if [ "$sites" != "$VM_SITES" ]; then VM_SITES="$sites"; save_vm_conf; fi
+
+  echo >&2
+  if [ "$action" != apply ]; then
+    ok "$fqdn ${action}d from $VM_NAME (sites: ${VM_SITES:-none})"
+    return 0
+  fi
+  ok "$fqdn is live on $VM_NAME (sites: $VM_SITES)"
+  tls_source="$(vm_ssh "sudo -n sed -n \"s/^SITE_TLS_SOURCE='\(.*\)'\$/\1/p\" /etc/macvs/sites/$fqdn/site.env" 2>/dev/null || true)"
+  hp="$(deploy_reach_port 80 || true)"; hps="$(deploy_reach_port 443 || true)"
+  url_http="http://$fqdn${hp:+$([ "$hp" = 80 ] || printf ':%s' "$hp")}/"
+  url_https="https://$fqdn${hps:+$([ "$hps" = 443 ] || printf ':%s' "$hps")}/"
+  if [ -n "$hp" ]; then
+    printf '%s From this Mac:%s  curl -H "Host: %s" http://%s:%s/  ->  %s\n' "$C_BOLD" "$C_RST" "$fqdn" "$VM_SSH_HOST" "$hp" \
+      "$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -H "Host: $fqdn" "http://$VM_SSH_HOST:$hp/" 2>/dev/null || echo 'no answer')" >&2
+  fi
+  cat >&2 <<EOT
+
+Next steps
+  Name -> VM:    macvs does not edit /etc/hosts. To use the name from this Mac, add:   127.0.0.1  $fqdn${aliases:+ $aliases}
+EOT
+  case "$tls_source" in
+    none|"")
+      cat >&2 <<EOT
+                 then open $url_http${hps:+  ($url_https once HTTPS is on)}
+  Certificate:   macvs ssh $VM_NAME sudo certbot certonly --dns-<provider> -d $fqdn${aliases:+ $(for p in $aliases; do printf -- '-d %s ' "$p"; done)}
+                 then re-run:  macvs deploy website $fqdn $VM_NAME     (HTTPS switches on by itself)
+EOT
+      ;;
+    self-signed*)
+      cat >&2 <<EOT
+                 then open $url_https  (self-signed: browsers warn, HSTS-preloaded TLDs refuse; curl -k works)
+  Certificate:   for a real one: macvs ssh $VM_NAME sudo certbot certonly --dns-<provider> -d $fqdn, then re-run without --self-signed
+EOT
+      ;;
+    *)
+      cat >&2 <<EOT
+                 then open $url_https  (HTTPS on: $tls_source; plain HTTP redirects there)
+EOT
+      ;;
+  esac
+  cat >&2 <<EOT
+  In the guest:  webroot /var/www/$fqdn/htdocs   vhost /etc/apache2/sites-available/$fqdn.conf
+                 database credentials (root only): sudo cat /etc/macvs/sites/$fqdn/secrets.env
+  Take it down:  macvs deploy website $fqdn $VM_NAME --remove   (add --purge to delete files, database, user)
+EOT
+}
+
+# ---------------------------------------------------------------------------
 cmd_deploy() {
   local sub="${1:-}"
   shift || true
   case "$sub" in
     webroot)        deploy_webroot "$@" ;;
+    website)        deploy_website "$@" ;;
     list|ls)        deploy_list ;;
     ""|-h|--help)   usage_deploy ;;
     *)              die "unknown profile '$sub' (see: macvs deploy list)" ;;

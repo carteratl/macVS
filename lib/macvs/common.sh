@@ -127,7 +127,7 @@ load_vm() {
   : "${VM_NAME:=$1}" "${VM_FORWARDS:=}" "${VM_EXTRA_ARGS:=}" "${VM_MACHINE:=virt}"
   : "${VM_DISK_CACHE:=$MACVS_DEFAULT_DISK_CACHE}" "${VM_BIND:=$MACVS_DEFAULT_BIND}"
   : "${VM_SSH_IDENTITY:=}" "${VM_TIMEZONE:=}" "${VM_PASSWORD_HASH:=}" "${VM_SSH_PUBKEY:=}"
-  : "${VM_PROVISION:=cloud-init}" "${VM_BALLOON:=on}" "${VM_AUTOSTART:=on}" "${VM_ORIGIN:=}" "${VM_PROFILES:=}"
+  : "${VM_PROVISION:=cloud-init}" "${VM_BALLOON:=on}" "${VM_AUTOSTART:=on}" "${VM_ORIGIN:=}" "${VM_PROFILES:=}" "${VM_SITES:=}"
 
   VM_DISK_PATH="$VM_DIR/disk.qcow2"
   VM_NVRAM_PATH="$VM_DIR/nvram.fd"
@@ -185,6 +185,7 @@ save_vm_conf() {
     printf 'VM_AUTOSTART=%s\n'     "$(shell_quote "$VM_AUTOSTART")"
     printf 'VM_ORIGIN=%s\n'        "$(shell_quote "$VM_ORIGIN")"
     printf 'VM_PROFILES=%s\n'      "$(shell_quote "$VM_PROFILES")"
+    printf 'VM_SITES=%s\n'         "$(shell_quote "$VM_SITES")"
   } > "$tmp"
   mv -f "$tmp" "$f"
 }
