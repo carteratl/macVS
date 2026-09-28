@@ -22,9 +22,10 @@ Connect:  macvs ssh web
 ```
 
 That is stage one: a clean Debian server with its lifecycle managed. Stage two adds
-provisioning profiles applied over SSH; the first, `macvs deploy webroot`, installs the
-web stack of the io-server project (Apache 2.4, PHP-FPM from Sury, MariaDB, certbot)
-and leaves the server ready for a site vhost and a webroot.
+provisioning profiles applied over SSH: `macvs deploy webroot` installs the web stack
+of the io-server project (Apache 2.4, PHP-FPM from Sury, MariaDB, certbot), and
+`macvs deploy website` puts a site on it, a domain or a subdomain, with its own user,
+PHP-FPM pool, vhost, webroot, and database.
 
 ## Requirements
 
@@ -56,6 +57,7 @@ and leaves VM data alone.
 ```bash
 macvs create web                # image (once), create, register with launchd, boot, wait
 macvs deploy webroot web        # Apache + PHP-FPM + MariaDB + certbot inside it (see below)
+macvs deploy website site.foo web   # a site on it: user, pool, vhost, Hello World webroot, database
 macvs ssh web                   # log in as 'admin' (passwordless sudo)
 macvs status web
 macvs stop web                  # clean ACPI power-off; comes back at next boot
@@ -134,6 +136,7 @@ hand-built QEMU plist.
 | `macvs wait <name>` | Block until SSH answers (and cloud-init is done) |
 | `macvs reseed <name>` | Rebuild the cloud-init seed after editing `vm.conf` (VM stopped) |
 | `macvs deploy webroot <name> [opts]` | Provision the web stack inside a running VM over SSH (re-runnable) |
+| `macvs deploy website <fqdn> <name> [opts]` | Create (or `--remove`) a site on a webroot server: user, FPM pool, vhost, webroot, database |
 | `macvs deploy list` | Available provisioning profiles |
 | `macvs daemon install <name> [--system\|--agent]` | Register with launchd (system needs sudo) |
 | `macvs daemon uninstall\|status\|plist <name>` | Manage or inspect the launchd job |
@@ -242,6 +245,46 @@ and parameters before anything runs. It works on Debian 13 guests (Debian 12 is
 accepted with a warning), created or imported, as long as the SSH user can `sudo`
 without a password. Defaults live in `~/.macvs/config` (`MACVS_WEBROOT_PHP`,
 `MACVS_WEBROOT_SWAP`, `MACVS_WEBROOT_FIREWALL`).
+
+### Adding a site: `macvs deploy website`
+
+```bash
+macvs deploy website somesite.foo web
+macvs deploy website sub.somesite.foo web --alias www.sub.somesite.foo
+```
+
+On a VM that has the webroot profile, `deploy website` creates one site per name, a
+domain or a subdomain, following io-server's site model:
+
+| Piece | Result |
+|---|---|
+| User | a locked Linux account named after the site (`sub-somesite-foo`), home under `/home` |
+| Webroot | `/var/www/<fqdn>/htdocs`, owned by the site user and readable by Apache, with a Hello World `index.php` written only while the directory has no index of its own |
+| PHP-FPM | a dedicated pool running as the site user on `/run/php/fpm-<id>.sock`, io's ondemand or dynamic tuning by guest size, PHP errors in `/var/log/macvs-sites/<fqdn>/php-error.log` with rotation |
+| Apache | `/etc/apache2/sites-available/<fqdn>.conf` for the name and any `--alias` names, `FallbackResource /index.php`, PHP through the pool; HTTP only until a certificate exists, then an HTTP-to-HTTPS redirect plus the HTTPS vhost |
+| Database | a MariaDB database and localhost-only user (`sub_somesite_foo`) with a generated password in `/etc/macvs/sites/<fqdn>/secrets.env`, root only; `--no-database` skips it |
+| Record | `/etc/macvs/sites/<fqdn>/site.env` in the guest, `sites` in `macvs status`, output in `logs/deploy-website.log` |
+
+**HTTPS.** By default the site is served over HTTPS as soon as
+`/etc/letsencrypt/live/<fqdn>/` exists: get the certificate inside the guest
+(`certbot certonly --dns-<provider> -d <fqdn>`), then re-run `deploy website` and the
+redirect and HTTPS vhost appear. `--self-signed` generates a certificate for the name
+and its aliases in the guest and serves HTTPS right away; browsers warn, and on an
+HSTS-preloaded TLD such as `.foo` they refuse it outright, so it suits names you do not
+own or tests with `curl -k`. `--cert FILE --key FILE` uses files already in the guest,
+for example from mkcert. `--http-only` keeps HTTPS off.
+
+**Reaching it.** macvs never edits `/etc/hosts`. Add `127.0.0.1  <fqdn>` (and the
+aliases) there yourself as described above, or test without it:
+`curl -H "Host: <fqdn>" http://127.0.0.1/`. Every other name keeps getting 403 from the
+default vhost.
+
+**Changing and removing.** Re-run with different options to converge; only what changed
+is rewritten. Apache is reloaded; adding or removing a pool restarts PHP-FPM, a
+sub-second blip for the other sites (a reload does not reliably pick up pool changes).
+`--remove` takes the site down (vhost and pool are removed; files, user, and database
+stay); `--remove --purge` also deletes `/var/www/<fqdn>`, the logs, the secrets, the
+database, and the user. The site name and the VM name may be given in either order.
 
 ## How it works
 
@@ -382,8 +425,8 @@ forever), and use `macvs import` to adopt the existing disk.
 
 ## Roadmap
 
-Later stages: a site profile on top of `webroot` (site user, FPM pool, database, vhost,
-certificate, WordPress), a vmnet option for VMs that need their own LAN address,
+Later stages: a WordPress profile on top of `website` (WP-CLI, core install, wp-config
+from the site's secrets), a vmnet option for VMs that need their own LAN address,
 snapshots, and `macvs hosts` to manage the `/etc/hosts` entries for internal sites.
 
 ## Repository layout
@@ -399,6 +442,7 @@ lib/macvs/deploy.sh       provisioning profiles: send a guest script over SSH, r
 lib/macvs/commands.sh     command implementations and dispatch
 share/macvs/macvs.conf.example
 share/macvs/deploy/webroot.sh                 the guest-side web-stack profile (bash, idempotent)
+share/macvs/deploy/website.sh                 the guest-side site profile: user, pool, vhost, webroot, database
 share/macvs/deploy/webroot-example-vhost.conf printed by `deploy webroot --example`
 docs/MIGRATING.md         adopting a hand-built QEMU VM
 install.sh

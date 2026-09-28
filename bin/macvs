@@ -4,7 +4,7 @@
 # launchd for running it as a service. See README.md.
 set -euo pipefail
 
-MACVS_VERSION="0.4.0"
+MACVS_VERSION="0.5.0"
 
 # Find the real location of this script (follows symlinks) so lib/ can be sourced.
 _macvs_self() {
