@@ -89,6 +89,10 @@ EOT
   cat <<EOT
   <key>WorkingDirectory</key>
   <string>$(xml_escape "$VM_DIR")</string>
+EOT
+  if [ "$VM_AUTOSTART" = on ]; then
+    # Start at boot/login; restart only after a non-zero exit (crash).
+    cat <<EOT
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -96,6 +100,15 @@ EOT
     <key>SuccessfulExit</key>
     <false/>
   </dict>
+EOT
+  else
+    # Manual: launchd only runs it when kicked (macvs start); no autostart, no restart.
+    cat <<EOT
+  <key>RunAtLoad</key>
+  <false/>
+EOT
+  fi
+  cat <<EOT
   <key>ThrottleInterval</key>
   <integer>15</integer>
   <key>ExitTimeOut</key>
@@ -179,6 +192,33 @@ launchd_uninstall() {
   launchd_sudo "$kind" launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
   launchd_sudo "$kind" rm -f "$plist"
   ok "removed launchd job for $VM_NAME ($kind)"
+}
+
+# Rewrite the installed plist after vm.conf changed (autostart). Applies immediately
+# if the VM is stopped; otherwise at the next boot/login or after a stop via macvs.
+launchd_refresh_plist() {
+  local kind label plist domain tmp
+  kind="$(launchd_kind "$VM_NAME")"; [ -n "$kind" ] || return 0
+  qemu_detect
+  label="$(launchd_label "$VM_NAME")"
+  plist="$(launchd_plist_path "$VM_NAME" "$kind")"
+  domain="$(launchd_domain "$kind")"
+  tmp="$(mktemp -t macvs-plist)"
+  launchd_render_plist "$kind" > "$tmp"
+  plutil -lint -s "$tmp" >/dev/null || { rm -f "$tmp"; die "generated plist failed validation"; }
+  if [ "$kind" = system ]; then
+    info "updating LaunchDaemon $plist (sudo may prompt for your password)"
+    sudo install -o root -g wheel -m 0644 "$tmp" "$plist"
+  else
+    install -m 0644 "$tmp" "$plist"
+  fi
+  rm -f "$tmp"
+  if vm_is_running; then
+    info "$VM_NAME is running; the new launchd settings take effect after the next stop or reboot"
+  else
+    launchd_sudo "$kind" launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
+    launchd_sudo "$kind" launchctl bootstrap "$domain" "$plist" || die "launchctl bootstrap failed"
+  fi
 }
 
 launchd_kickstart() {

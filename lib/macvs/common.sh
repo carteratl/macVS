@@ -17,7 +17,9 @@ MACVS_DEFAULT_CPUS="${MACVS_DEFAULT_CPUS:-2}"
 MACVS_DEFAULT_MEMORY="${MACVS_DEFAULT_MEMORY:-2048}"            # MiB
 MACVS_DEFAULT_DISK="${MACVS_DEFAULT_DISK:-25G}"
 MACVS_DEFAULT_USER="${MACVS_DEFAULT_USER:-admin}"
-MACVS_DEFAULT_BIND="${MACVS_DEFAULT_BIND:-127.0.0.1}"           # 0.0.0.0 exposes forwards on the LAN
+MACVS_DEFAULT_BIND="${MACVS_DEFAULT_BIND:-0.0.0.0}"             # 0.0.0.0 = reachable from the LAN; 127.0.0.1 = this Mac only
+MACVS_DEFAULT_WEB_FORWARDS="${MACVS_DEFAULT_WEB_FORWARDS:-80:80 443:443}"  # added to every VM unless --no-web
+MACVS_DEFAULT_DAEMON="${MACVS_DEFAULT_DAEMON:-system}"          # system | agent | none: how create/import register with launchd
 MACVS_DEFAULT_SSH_PORT_BASE="${MACVS_DEFAULT_SSH_PORT_BASE:-2222}"
 MACVS_DEFAULT_DISK_CACHE="${MACVS_DEFAULT_DISK_CACHE:-writeback}"
 MACVS_IMAGE_BASE_URL="${MACVS_IMAGE_BASE_URL:-https://cloud.debian.org/images/cloud}"
@@ -123,7 +125,8 @@ load_vm() {
   . "$VM_DIR/vm.conf"
   : "${VM_NAME:=$1}" "${VM_FORWARDS:=}" "${VM_EXTRA_ARGS:=}" "${VM_MACHINE:=virt}"
   : "${VM_DISK_CACHE:=$MACVS_DEFAULT_DISK_CACHE}" "${VM_BIND:=$MACVS_DEFAULT_BIND}"
-  : "${VM_SSH_IDENTITY:=}" "${VM_TIMEZONE:=}" "${VM_PASSWORD_HASH:=}"
+  : "${VM_SSH_IDENTITY:=}" "${VM_TIMEZONE:=}" "${VM_PASSWORD_HASH:=}" "${VM_SSH_PUBKEY:=}"
+  : "${VM_PROVISION:=cloud-init}" "${VM_BALLOON:=on}" "${VM_AUTOSTART:=on}" "${VM_ORIGIN:=}"
 
   VM_DISK_PATH="$VM_DIR/disk.qcow2"
   VM_NVRAM_PATH="$VM_DIR/nvram.fd"
@@ -176,6 +179,10 @@ save_vm_conf() {
     printf 'VM_TIMEZONE=%s\n'      "$(shell_quote "$VM_TIMEZONE")"
     printf 'VM_PASSWORD_HASH=%s\n' "$(shell_quote "$VM_PASSWORD_HASH")"
     printf 'VM_EXTRA_ARGS=%s\n'    "$(shell_quote "$VM_EXTRA_ARGS")"
+    printf 'VM_PROVISION=%s\n'     "$(shell_quote "$VM_PROVISION")"
+    printf 'VM_BALLOON=%s\n'       "$(shell_quote "$VM_BALLOON")"
+    printf 'VM_AUTOSTART=%s\n'     "$(shell_quote "$VM_AUTOSTART")"
+    printf 'VM_ORIGIN=%s\n'        "$(shell_quote "$VM_ORIGIN")"
   } > "$tmp"
   mv -f "$tmp" "$f"
 }
@@ -208,11 +215,23 @@ pick_free_port() {
 }
 
 # Validate a host:guest forward spec and check the host port is free.
+# $2 is an optional hint appended to the error message.
 check_forward() {
-  local spec="$1" h g owner
+  local spec="$1" hint="${2:-}" h g owner
   h="${spec%%:*}"; g="${spec##*:}"
   [ "$h" != "$spec" ] && is_int "$h" && is_int "$g" || die "bad forward '$spec' (expected HOSTPORT:GUESTPORT)"
-  if owner="$(port_used_by_vm "$h")"; then die "host port $h is already assigned to VM '$owner'"; fi
-  port_listening "$h" && die "host port $h is already in use on this Mac"
+  if owner="$(port_used_by_vm "$h")"; then die "host port $h is already assigned to VM '$owner'${hint:+; $hint}"; fi
+  port_listening "$h" && die "host port $h is already in use on this Mac${hint:+; $hint}"
   return 0
+}
+
+# Merge user forwards with the default web forwards (user entries win per host port).
+merge_web_forwards() { # user-forwards-string
+  local out="$1" w u dup
+  for w in $MACVS_DEFAULT_WEB_FORWARDS; do
+    dup=""
+    for u in $1; do [ "${u%%:*}" = "${w%%:*}" ] && dup=1; done
+    [ -n "$dup" ] || out="$out $w"
+  done
+  printf '%s\n' "$out"
 }

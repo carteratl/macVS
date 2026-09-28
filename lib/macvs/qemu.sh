@@ -44,7 +44,15 @@ qemu_build_args() {
     -drive "if=pflash,format=raw,readonly=on,file=$MACVS_FW_CODE"
     -drive "if=pflash,format=raw,file=$VM_NVRAM_PATH"
     -drive "file=$VM_DISK_PATH,if=virtio,format=qcow2,cache=$VM_DISK_CACHE,discard=unmap"
-    -drive "file=$VM_SEED_PATH,if=virtio,format=raw,readonly=on"
+  )
+  if [ "$VM_PROVISION" = cloud-init ]; then
+    QEMU_ARGS+=(-drive "file=$VM_SEED_PATH,if=virtio,format=raw,readonly=on")
+  fi
+  if [ "$VM_BALLOON" = on ]; then
+    # Guest hands freed pages back to macOS within seconds instead of pinning them.
+    QEMU_ARGS+=(-device virtio-balloon-pci,free-page-reporting=on,deflate-on-oom=on)
+  fi
+  QEMU_ARGS+=(
     -device virtio-net-pci,netdev=net0
     -netdev "$net"
     -device virtio-rng-pci
@@ -88,7 +96,9 @@ vm_prepare_runtime() {
   rm -f "$VM_QMP_SOCK" "$VM_CONSOLE_SOCK"
   [ -f "$VM_DISK_PATH" ]  || die "disk image missing: $VM_DISK_PATH"
   [ -f "$VM_NVRAM_PATH" ] || die "UEFI variable store missing: $VM_NVRAM_PATH"
-  [ -f "$VM_SEED_PATH" ]  || die "cloud-init seed missing: $VM_SEED_PATH (run: macvs reseed $VM_NAME)"
+  if [ "$VM_PROVISION" = cloud-init ]; then
+    [ -f "$VM_SEED_PATH" ] || die "cloud-init seed missing: $VM_SEED_PATH (run: macvs reseed $VM_NAME)"
+  fi
   hvf_available || die "Hypervisor.framework is not available on this Mac"
 }
 
@@ -112,8 +122,12 @@ vm_start_direct() {
   qemu_build_args
   info "starting $VM_NAME ($VM_CPUS vCPU, ${VM_MEMORY} MiB, ssh ${VM_SSH_HOST}:${VM_SSH_PORT})"
   printf '%s starting (direct): %s\n' "$(now_iso)" "$MACVS_QEMU_BIN ${QEMU_ARGS[*]}" >> "$VM_QEMU_LOG"
-  if ! "$MACVS_QEMU_BIN" "${QEMU_ARGS[@]}" -daemonize 2> >(tee -a "$VM_QEMU_LOG" >&2); then
-    die "QEMU failed to start (see $VM_QEMU_LOG)"
+  # QEMU's stderr goes straight to the log. (A process substitution here makes bash 3.2
+  # wait on the tee child, which never exits when our stdout is a pipe.)
+  if ! "$MACVS_QEMU_BIN" "${QEMU_ARGS[@]}" -daemonize 2>>"$VM_QEMU_LOG"; then
+    err "QEMU failed to start; last lines of $VM_QEMU_LOG:"
+    tail -n 5 "$VM_QEMU_LOG" >&2
+    exit 1
   fi
   sleep 1
   pid="$(vm_pid)" || die "QEMU exited immediately after start (see $VM_QEMU_LOG and $VM_CONSOLE_LOG)"
@@ -199,12 +213,34 @@ vm_ssh() {
   ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=5 "$VM_SSH_DEST" "$@"
 }
 
+# Is sshd answering behind the forward? (A bare TCP connect is not enough: slirp
+# accepts the host-side connection before it knows whether the guest port is open.)
+ssh_banner_up() {
+  local line
+  line="$(nc -w 3 "$VM_SSH_HOST" "$VM_SSH_PORT" </dev/null 2>/dev/null | head -n 1 || true)"
+  case "$line" in SSH-*) return 0 ;; *) return 1 ;; esac
+}
+
 vm_wait_ssh() { # [timeout]
-  local timeout="${1:-$MACVS_SSH_TIMEOUT}" t=0
+  local timeout="${1:-$MACVS_SSH_TIMEOUT}" t=0 banner_at="" auth_grace=45
   info "waiting for SSH at ${VM_SSH_HOST}:${VM_SSH_PORT} (up to ${timeout}s)"
   while [ "$t" -lt "$timeout" ]; do
     vm_is_running || die "$VM_NAME is no longer running (see $VM_CONSOLE_LOG)"
-    if vm_ssh true 2>/dev/null; then ok "SSH is up after ${t}s"; return 0; fi
+    if [ -z "$banner_at" ] && ssh_banner_up; then
+      banner_at="$t"
+      if [ "$VM_PROVISION" != cloud-init ] && [ -z "$VM_SSH_IDENTITY" ]; then
+        ok "SSH is answering after ${t}s (no key configured; 'macvs ssh' will ask for a password)"
+        return 0
+      fi
+    fi
+    if [ -n "$banner_at" ]; then
+      if vm_ssh true 2>/dev/null; then ok "SSH is up after ${t}s"; return 0; fi
+      # Imported systems: we cannot know the key is right, so do not block forever.
+      if [ "$VM_PROVISION" != cloud-init ] && [ $((t - banner_at)) -ge "$auth_grace" ]; then
+        warn "SSH answers but key authentication as $VM_USER failed; check --user/--ssh-key (macvs ssh will prompt)"
+        return 0
+      fi
+    fi
     sleep 3; t=$((t + 3))
   done
   die "timed out waiting for SSH (see $VM_CONSOLE_LOG)"

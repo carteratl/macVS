@@ -6,7 +6,8 @@
 #MACVS_DEFAULT_RELEASE=trixie
 #MACVS_DEFAULT_VARIANT=generic
 
-# Default VM sizing.
+# Default VM sizing. Memory is the ceiling; a virtio balloon returns freed guest
+# memory to macOS, so an idle VM costs far less than this.
 #MACVS_DEFAULT_CPUS=2
 #MACVS_DEFAULT_MEMORY=2048      # MiB
 #MACVS_DEFAULT_DISK=25G
@@ -14,9 +15,19 @@
 # Guest admin user created by cloud-init.
 #MACVS_DEFAULT_USER=admin
 
-# Address host port-forwards bind to. 127.0.0.1 keeps VMs reachable only from
-# this Mac; 0.0.0.0 exposes the forwarded ports on your LAN.
-#MACVS_DEFAULT_BIND=127.0.0.1
+# Address host port-forwards bind to. 0.0.0.0 makes the VM's forwarded ports
+# reachable from other machines on your network; 127.0.0.1 keeps them on this Mac.
+#MACVS_DEFAULT_BIND=0.0.0.0
+
+# Forwards added to every new VM unless --no-web is given (host:guest, space separated).
+# Only one VM can own a host port; later VMs need --no-web or other --forward values.
+#MACVS_DEFAULT_WEB_FORWARDS="80:80 443:443"
+
+# How create/import register the VM with launchd:
+#   system = /Library/LaunchDaemons, boots with the Mac (sudo prompts once)
+#   agent  = ~/Library/LaunchAgents, starts when you log in (no sudo)
+#   none   = do not register; start by hand with `macvs start`
+#MACVS_DEFAULT_DAEMON=system
 
 # First SSH port tried when --ssh-port is not given (next free one is used).
 #MACVS_DEFAULT_SSH_PORT_BASE=2222
@@ -27,7 +38,7 @@
 # Seconds to wait for a clean ACPI shutdown before forcing QEMU to quit.
 #MACVS_STOP_TIMEOUT=90
 
-# Seconds `create --start` / `wait` will wait for first SSH.
+# Seconds `create`/`import`/`wait` will wait for SSH.
 #MACVS_SSH_TIMEOUT=300
 
 # launchd label prefix; jobs are named <prefix>.<vm-name>.

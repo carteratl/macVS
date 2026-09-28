@@ -4,15 +4,17 @@
 
 usage() {
   cat <<EOT
-macvs $MACVS_VERSION - Debian virtual servers on Apple Silicon (QEMU + Hypervisor.framework + launchd)
+macvs $MACVS_VERSION - durable Debian servers on Apple Silicon (QEMU + Hypervisor.framework + launchd)
 
 Usage: macvs <command> [options]
 
 VM lifecycle
-  create <name> [options]     Create a Debian server (see 'macvs create --help')
-  start <name>                Boot a VM (via launchd if a daemon is installed)
+  create <name> [options]     New Debian server: image, cloud-init, launchd job, boot (create --help)
+  import <name> --disk FILE   Adopt an existing qcow2 as a macvs-managed server (import --help)
+  start <name>                Boot a VM (via launchd if it has a job)
   stop <name> [--force]       Power a VM off cleanly (ACPI), escalating if needed
   restart <name>
+  autostart <name> [on|off]   Show or set whether the VM boots with the Mac (default on)
   destroy <name> [--yes]      Stop, remove its launchd job, and delete all its files
   run <name>                  Run QEMU in the foreground (what launchd executes)
 
@@ -23,7 +25,7 @@ Inspect and connect
   ssh-config <name>           Print an ~/.ssh/config Host block
   console <name>              Attach to the serial console (Ctrl-] detaches)
   logs <name> [-f] [--qemu|--launchd]
-  wait <name>                 Block until SSH and cloud-init are ready
+  wait <name>                 Block until SSH (and cloud-init, if any) are ready
   reseed <name>               Rebuild the cloud-init seed from vm.conf (VM must be stopped)
 
 Deployment
@@ -49,12 +51,17 @@ usage_create() {
   cat <<EOT
 Usage: macvs create <name> [options]
 
+By default the new server gets the web ports (${MACVS_DEFAULT_WEB_FORWARDS// /, }) and SSH forwarded
+from all of this Mac's addresses, is registered as a launchd ${MACVS_DEFAULT_DAEMON} job that
+boots with the Mac, and is started right away.
+
   --cpus N             vCPUs                          (default $MACVS_DEFAULT_CPUS)
-  --memory MiB         RAM in MiB                     (default $MACVS_DEFAULT_MEMORY)
+  --memory MiB         RAM in MiB; freed guest memory is returned to macOS (default $MACVS_DEFAULT_MEMORY)
   --disk SIZE          Virtual disk size, e.g. 25G    (default $MACVS_DEFAULT_DISK)
   --ssh-port PORT      Host port forwarded to guest 22 (default: first free from $MACVS_DEFAULT_SSH_PORT_BASE)
   --forward H:G        Extra TCP forward host:guest; repeatable or comma-separated
-  --bind ADDR          Host address forwards bind to  (default $MACVS_DEFAULT_BIND; 0.0.0.0 = LAN)
+  --no-web             Do not forward the default web ports
+  --bind ADDR          Address forwards bind to       (default $MACVS_DEFAULT_BIND)
   --user NAME          Admin user created in the guest (default $MACVS_DEFAULT_USER)
   --ssh-key FILE.pub   Public key to authorise        (default: ~/.ssh/id_{ed25519,ecdsa,rsa}.pub, else a new per-VM key)
   --password           Prompt for a console password for the admin user (SSH stays key-only)
@@ -62,38 +69,137 @@ Usage: macvs create <name> [options]
   --release NAME       Debian release codename        (default $MACVS_DEFAULT_RELEASE = Debian 13)
   --variant NAME       Cloud image variant            (default $MACVS_DEFAULT_VARIANT)
   --cache MODE         QEMU disk cache mode           (default $MACVS_DEFAULT_DISK_CACHE)
-  --start              Boot after creating and wait until SSH + cloud-init are ready
-  --daemon [system|agent]  Also register with launchd and start it (system needs sudo)
+  --no-balloon         Disable the virtio memory balloon
+  --agent              Register as a per-user LaunchAgent (starts at login, no sudo)
+  --no-daemon          Only create the VM; do not register with launchd or start it
+  --no-wait            Do not wait for SSH and cloud-init
+EOT
+}
+
+usage_import() {
+  cat <<EOT
+Usage: macvs import <name> --disk FILE.qcow2 [options]
+
+Adopts an existing Debian/Linux disk image as a macvs-managed server. The disk is
+cloned into ~/.macvs/vms/<name> (instant on APFS), no cloud-init seed is attached,
+and the VM is registered with launchd and started like a created one.
+
+  --disk FILE          Existing qcow2 image (required; must not be in use)
+  --nvram FILE         Existing UEFI variable store; strongly recommended for systems
+                       installed from an installer ISO, whose boot entry lives there
+  --move               Remove the source files after a successful import
+  --resize SIZE        Grow the virtual disk, e.g. 40G (never shrinks)
+  --user NAME          Guest login user for 'macvs ssh' (default $MACVS_DEFAULT_USER)
+  --ssh-key FILE       Private key (or its .pub) that user accepts
+  --cpus N | --memory MiB | --ssh-port PORT | --forward H:G | --no-web | --bind ADDR
+  --cache MODE | --no-balloon | --agent | --no-daemon | --no-wait   (as for create)
 EOT
 }
 
 # ---------------------------------------------------------------------------
-cmd_create() {
-  local name="" cpus="$MACVS_DEFAULT_CPUS" memory="$MACVS_DEFAULT_MEMORY" disk="$MACVS_DEFAULT_DISK"
-  local ssh_port="" forwards="" bind="$MACVS_DEFAULT_BIND" user="$MACVS_DEFAULT_USER" sshkey=""
-  local want_password="" tz="" release="$MACVS_DEFAULT_RELEASE" variant="$MACVS_DEFAULT_VARIANT"
-  local cache="$MACVS_DEFAULT_DISK_CACHE" do_start="" daemon_kind="" f pw pw2 hash
+# Shared pieces for create and import
+# ---------------------------------------------------------------------------
+# Parse options common to create and import into OPT_* variables. Prints unknown
+# options back (one per line) for the caller to handle.
+parse_common_opt() { # option [value] -> returns 0 if consumed 2 args, 1 if consumed 1, 2 if not ours
+  case "$1" in
+    --cpus)      OPT_CPUS="$2"; return 0 ;;
+    --memory)    OPT_MEMORY="$2"; return 0 ;;
+    --ssh-port)  OPT_SSH_PORT="$2"; return 0 ;;
+    --forward)   OPT_FORWARDS="$OPT_FORWARDS ${2//,/ }"; return 0 ;;
+    --bind)      OPT_BIND="$2"; return 0 ;;
+    --user)      OPT_USER="$2"; return 0 ;;
+    --ssh-key)   OPT_SSHKEY="$2"; return 0 ;;
+    --cache)     OPT_CACHE="$2"; return 0 ;;
+    --no-web)    OPT_WEB=no; return 1 ;;
+    --no-balloon) OPT_BALLOON=off; return 1 ;;
+    --agent)     OPT_DAEMON=agent; return 1 ;;
+    --no-daemon) OPT_DAEMON=none; return 1 ;;
+    --no-wait)   OPT_WAIT=no; return 1 ;;
+    *) return 2 ;;
+  esac
+}
 
+init_common_opts() {
+  OPT_CPUS="$MACVS_DEFAULT_CPUS"; OPT_MEMORY="$MACVS_DEFAULT_MEMORY"; OPT_SSH_PORT=""; OPT_FORWARDS=""
+  OPT_BIND="$MACVS_DEFAULT_BIND"; OPT_USER="$MACVS_DEFAULT_USER"; OPT_SSHKEY=""; OPT_CACHE="$MACVS_DEFAULT_DISK_CACHE"
+  OPT_WEB=yes; OPT_BALLOON=on; OPT_DAEMON="$MACVS_DEFAULT_DAEMON"; OPT_WAIT=yes
+}
+
+validate_common_opts() {
+  is_int "$OPT_CPUS"   && [ "$OPT_CPUS" -ge 1 ]     || die "--cpus must be a positive integer"
+  is_int "$OPT_MEMORY" && [ "$OPT_MEMORY" -ge 512 ] || die "--memory must be an integer >= 512 (MiB)"
+  [[ "$OPT_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "--user must be a lowercase unix username"
+  [[ "$OPT_CACHE" =~ ^(writeback|writethrough|none|unsafe|directsync)$ ]] || die "--cache must be a QEMU cache mode"
+  [[ "$OPT_DAEMON" =~ ^(system|agent|none)$ ]] || die "MACVS_DEFAULT_DAEMON must be system, agent, or none"
+  if [ "$OPT_BIND" != 0.0.0.0 ] && [ "$OPT_BIND" != 127.0.0.1 ]; then
+    [[ "$OPT_BIND" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--bind must be an IPv4 address"
+  fi
+}
+
+# Resolve SSH port and forwards (with web defaults) into OPT_SSH_PORT / OPT_FORWARDS.
+resolve_ports() {
+  local f hint
+  if [ -n "$OPT_SSH_PORT" ]; then
+    is_int "$OPT_SSH_PORT" || die "--ssh-port must be an integer"
+    check_forward "$OPT_SSH_PORT:22"
+  else
+    OPT_SSH_PORT="$(pick_free_port "$MACVS_DEFAULT_SSH_PORT_BASE")"
+  fi
+  for f in $OPT_FORWARDS; do check_forward "$f"; done
+  if [ "$OPT_WEB" = yes ]; then
+    hint="the web ports are forwarded by default; pass --no-web, or --forward to pick others"
+    for f in $(merge_web_forwards "$OPT_FORWARDS"); do
+      case " $OPT_FORWARDS " in *" $f "*) ;; *) check_forward "$f" "$hint" ;; esac
+    done
+    OPT_FORWARDS="$(merge_web_forwards "$OPT_FORWARDS")"
+  fi
+  # shellcheck disable=SC2086
+  OPT_FORWARDS="$(printf '%s\n' $OPT_FORWARDS | sort -u | tr '\n' ' ' | sed 's/ *$//')"
+}
+
+# Register with launchd (or not), wait for the guest, print how to connect.
+bringup_vm() {
+  echo
+  if [ "$OPT_DAEMON" = none ]; then
+    printf 'Created without a launchd job. Boot it with:  macvs start %s\n' "$VM_NAME" >&2
+    return 0
+  fi
+  launchd_install "$OPT_DAEMON"
+  if [ "$OPT_WAIT" = yes ]; then
+    vm_wait_ssh
+    [ "$VM_PROVISION" = cloud-init ] && vm_wait_cloudinit
+    print_connect_hint
+  fi
+}
+
+print_connect_hint() {
+  echo >&2
+  printf '%sConnect:%s  macvs ssh %s\n' "$C_BOLD" "$C_RST" "$VM_NAME" >&2
+  printf '          ssh %s-p %s %s\n' "${VM_SSH_IDENTITY:+-i $VM_SSH_IDENTITY }" "$VM_SSH_PORT" "$VM_SSH_DEST" >&2
+}
+
+# Guard: remove a half-created VM directory if the command dies before CREATE_DONE=1.
+arm_create_cleanup() {
+  CREATE_DONE=""
+  trap '[ -n "$CREATE_DONE" ] || { err "aborted; removing $VM_DIR"; rm -rf "$VM_DIR"; }' EXIT
+}
+disarm_create_cleanup() { CREATE_DONE=1; trap - EXIT; }
+
+# ---------------------------------------------------------------------------
+cmd_create() {
+  local name="" disk="$MACVS_DEFAULT_DISK" want_password="" tz="" release="$MACVS_DEFAULT_RELEASE"
+  local variant="$MACVS_DEFAULT_VARIANT" pw pw2 hash identity=""
+  init_common_opts
   while [ $# -gt 0 ]; do
+    if parse_common_opt "$@"; then shift 2; continue; else case $? in 1) shift; continue ;; esac; fi
     case "$1" in
-      -h|--help) usage_create; return 0 ;;
-      --cpus)     cpus="$2"; shift 2 ;;
-      --memory)   memory="$2"; shift 2 ;;
+      -h|--help)  usage_create; return 0 ;;
       --disk)     disk="$2"; shift 2 ;;
-      --ssh-port) ssh_port="$2"; shift 2 ;;
-      --forward)  forwards="$forwards ${2//,/ }"; shift 2 ;;
-      --bind)     bind="$2"; shift 2 ;;
-      --user)     user="$2"; shift 2 ;;
-      --ssh-key)  sshkey="$2"; shift 2 ;;
       --password) want_password=1; shift ;;
       --timezone) tz="$2"; shift 2 ;;
       --release)  release="$2"; shift 2 ;;
       --variant)  variant="$2"; shift 2 ;;
-      --cache)    cache="$2"; shift 2 ;;
-      --start)    do_start=1; shift ;;
-      --daemon)
-        do_start=1
-        case "${2:-}" in system|agent) daemon_kind="$2"; shift 2 ;; *) daemon_kind=system; shift ;; esac ;;
       -*) die "unknown option for create: $1 (try: macvs create --help)" ;;
       *)  [ -z "$name" ] || die "unexpected argument: $1"; name="$1"; shift ;;
     esac
@@ -101,34 +207,19 @@ cmd_create() {
   [ -n "$name" ] || { usage_create; die "a VM name is required"; }
   validate_name "$name"
   vm_exists "$name" && die "VM '$name' already exists"
-  is_int "$cpus"   && [ "$cpus" -ge 1 ]   || die "--cpus must be a positive integer"
-  is_int "$memory" && [ "$memory" -ge 512 ] || die "--memory must be an integer >= 512 (MiB)"
+  validate_common_opts
   [[ "$disk" =~ ^[0-9]+[GgMm]$ ]] || die "--disk must look like 25G"
-  [[ "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "--user must be a lowercase unix username"
-  [[ "$cache" =~ ^(writeback|writethrough|none|unsafe|directsync)$ ]] || die "--cache must be a QEMU cache mode"
 
   require_cmd hdiutil; require_cmd nc; require_cmd ssh; require_cmd ssh-keygen
   qemu_detect
-  hvf_available || die "Hypervisor.framework not available (kern.hv_support != 1); macvs needs Apple Silicon with virtualization enabled"
+  hvf_available || die "Hypervisor.framework not available (kern.hv_support != 1)"
+  [ "$OPT_DAEMON" = none ] || launchd_preflight
+  resolve_ports
 
-  # Ports
-  if [ -n "$ssh_port" ]; then
-    is_int "$ssh_port" || die "--ssh-port must be an integer"
-    check_forward "$ssh_port:22"
-  else
-    ssh_port="$(pick_free_port "$MACVS_DEFAULT_SSH_PORT_BASE")"
-  fi
-  for f in $forwards; do check_forward "$f"; done
-  forwards="$(printf '%s\n' $forwards | sort -u | tr '\n' ' ' | sed 's/ *$//')"
-  if [ "$bind" != 0.0.0.0 ] && [ "$bind" != 127.0.0.1 ]; then
-    [[ "$bind" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--bind must be an IPv4 address"
-  fi
-
-  # Console password (optional)
   hash=""
   if [ -n "$want_password" ]; then
     [ -t 0 ] || die "--password needs an interactive terminal"
-    printf 'Console password for %s: ' "$user" >&2; read -r -s pw; echo >&2
+    printf 'Console password for %s: ' "$OPT_USER" >&2; read -r -s pw; echo >&2
     printf 'Repeat password: ' >&2; read -r -s pw2; echo >&2
     [ "$pw" = "$pw2" ] || die "passwords do not match"
     [ -n "$pw" ] || die "empty password"
@@ -136,19 +227,15 @@ cmd_create() {
     unset pw pw2
   fi
 
-  # Base image (network only if not cached)
   image_ensure "$release" "$variant"
 
-  # Create the VM directory; clean it up if anything below fails.
   VM_DIR="$(vm_dir "$name")"
   [ -e "$VM_DIR" ] && die "$VM_DIR already exists but has no vm.conf; remove it manually"
   mkdir -p "$VM_DIR/run" "$VM_DIR/logs" "$VM_DIR/ssh" "$VM_DIR/cloud-init"
   chmod 700 "$VM_DIR"
-  CREATE_DONE=""
-  trap '[ -n "$CREATE_DONE" ] || { err "create failed; removing $VM_DIR"; rm -rf "$VM_DIR"; }' EXIT
+  arm_create_cleanup
 
-  # SSH key
-  local identity=""
+  local sshkey="$OPT_SSHKEY"
   if [ -n "$sshkey" ]; then
     [ -f "$sshkey" ] || die "--ssh-key file not found: $sshkey"
     grep -qE '^(ssh-|ecdsa-|sk-)' "$sshkey" || die "$sshkey does not look like an OpenSSH public key"
@@ -163,49 +250,123 @@ cmd_create() {
   fi
 
   VM_NAME="$name"; VM_CREATED="$(now_iso)"; VM_RELEASE="$release"; VM_VARIANT="$variant"
-  VM_IMAGE="$IMG_FILE"; VM_IMAGE_SHA512="$IMG_SHA"; VM_CPUS="$cpus"; VM_MEMORY="$memory"
-  VM_DISK="$disk"; VM_DISK_CACHE="$cache"; VM_MACHINE=virt; VM_BIND="$bind"; VM_SSH_PORT="$ssh_port"
-  VM_FORWARDS="$forwards"; VM_USER="$user"; VM_SSH_PUBKEY="$sshkey"; VM_SSH_IDENTITY="$identity"
+  VM_IMAGE="$IMG_FILE"; VM_IMAGE_SHA512="$IMG_SHA"; VM_CPUS="$OPT_CPUS"; VM_MEMORY="$OPT_MEMORY"
+  VM_DISK="$disk"; VM_DISK_CACHE="$OPT_CACHE"; VM_MACHINE=virt; VM_BIND="$OPT_BIND"; VM_SSH_PORT="$OPT_SSH_PORT"
+  VM_FORWARDS="$OPT_FORWARDS"; VM_USER="$OPT_USER"; VM_SSH_PUBKEY="$sshkey"; VM_SSH_IDENTITY="$identity"
   VM_TIMEZONE="${tz:-$(host_timezone)}"; VM_PASSWORD_HASH="$hash"; VM_EXTRA_ARGS=""
+  VM_PROVISION=cloud-init; VM_BALLOON="$OPT_BALLOON"; VM_AUTOSTART=on; VM_ORIGIN=""
   save_vm_conf
   load_vm "$name"
 
-  # Disk: clone the verified base image (instant on APFS) and grow it.
   info "creating ${disk} disk from $IMG_FILE"
   cp -c "$IMG_PATH" "$VM_DISK_PATH" 2>/dev/null || cp "$IMG_PATH" "$VM_DISK_PATH"
   "$MACVS_QEMU_IMG" resize -q "$VM_DISK_PATH" "$disk" || die "qemu-img resize failed"
   chmod 600 "$VM_DISK_PATH"
-
-  # UEFI variable store, one per VM.
   cp "$MACVS_FW_VARS" "$VM_NVRAM_PATH"; chmod 600 "$VM_NVRAM_PATH"
 
-  # cloud-init seed
-  info "building cloud-init seed (user '$user', hostname '${name%%.*}')"
+  info "building cloud-init seed (user '$OPT_USER', hostname '${name%%.*}')"
   cloudinit_generate
 
-  CREATE_DONE=1
-  trap - EXIT
+  disarm_create_cleanup
   ok "created $name in $VM_DIR"
   echo
   cmd_status "$name"
-
-  if [ -n "$daemon_kind" ]; then
-    echo
-    launchd_install "$daemon_kind"
-    vm_wait_ssh; vm_wait_cloudinit; print_connect_hint
-  elif [ -n "$do_start" ]; then
-    echo
-    vm_start_direct; vm_wait_ssh; vm_wait_cloudinit; print_connect_hint
-  else
-    echo
-    printf 'Next:  macvs start %s        (or: macvs daemon install %s)\n' "$name" "$name" >&2
-  fi
+  bringup_vm
 }
 
-print_connect_hint() {
-  echo >&2
-  printf '%sConnect:%s  macvs ssh %s\n' "$C_BOLD" "$C_RST" "$VM_NAME" >&2
-  printf '          ssh %s -p %s %s\n' "${VM_SSH_IDENTITY:+-i $VM_SSH_IDENTITY}" "$VM_SSH_PORT" "$VM_SSH_DEST" >&2
+# ---------------------------------------------------------------------------
+cmd_import() {
+  local name="" src_disk="" src_nvram="" move="" resize="" identity="" pubkey="" vbytes vsize
+  init_common_opts
+  while [ $# -gt 0 ]; do
+    if parse_common_opt "$@"; then shift 2; continue; else case $? in 1) shift; continue ;; esac; fi
+    case "$1" in
+      -h|--help) usage_import; return 0 ;;
+      --disk)    src_disk="$2"; shift 2 ;;
+      --nvram)   src_nvram="$2"; shift 2 ;;
+      --move)    move=1; shift ;;
+      --resize)  resize="$2"; shift 2 ;;
+      -*) die "unknown option for import: $1 (try: macvs import --help)" ;;
+      *)  [ -z "$name" ] || die "unexpected argument: $1"; name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || { usage_import; die "a VM name is required"; }
+  validate_name "$name"
+  vm_exists "$name" && die "VM '$name' already exists"
+  [ -n "$src_disk" ] || die "--disk FILE is required"
+  [ -f "$src_disk" ] || die "disk image not found: $src_disk"
+  [ -z "$src_nvram" ] || [ -f "$src_nvram" ] || die "NVRAM file not found: $src_nvram"
+  [ -z "$resize" ] || [[ "$resize" =~ ^[0-9]+[GgMm]$ ]] || die "--resize must look like 40G"
+  validate_common_opts
+  require_cmd nc; require_cmd ssh
+  qemu_detect
+  hvf_available || die "Hypervisor.framework not available (kern.hv_support != 1)"
+  [ "$OPT_DAEMON" = none ] || launchd_preflight
+
+  # The image must be qcow2 and not opened by a running QEMU (its lock would make us fail).
+  local fmt
+  if ! fmt="$("$MACVS_QEMU_IMG" info "$src_disk" 2>&1)"; then
+    case "$fmt" in
+      *lock*) die "$src_disk is in use by a running VM; shut that VM down first" ;;
+      *)      die "qemu-img cannot read $src_disk: $fmt" ;;
+    esac
+  fi
+  printf '%s\n' "$fmt" | grep -q '^file format: qcow2$' \
+    || die "$src_disk is not qcow2 (convert first: qemu-img convert -O qcow2 IN OUT)"
+  vbytes="$(printf '%s\n' "$fmt" | sed -n 's/^virtual size:.*(\([0-9]*\) bytes).*/\1/p')"
+  if [ -n "$vbytes" ] && [ $((vbytes % 1073741824)) -eq 0 ]; then vsize="$((vbytes / 1073741824))G"
+  elif [ -n "$vbytes" ]; then vsize="$((vbytes / 1048576))M"; else vsize="unknown"; fi
+
+  if [ -n "$OPT_SSHKEY" ]; then
+    [ -f "$OPT_SSHKEY" ] || die "--ssh-key file not found: $OPT_SSHKEY"
+    case "$OPT_SSHKEY" in
+      *.pub) pubkey="$OPT_SSHKEY"; [ -f "${OPT_SSHKEY%.pub}" ] && identity="${OPT_SSHKEY%.pub}" ;;
+      *)     identity="$OPT_SSHKEY"; [ -f "$OPT_SSHKEY.pub" ] && pubkey="$OPT_SSHKEY.pub" ;;
+    esac
+  fi
+  resolve_ports
+
+  VM_DIR="$(vm_dir "$name")"
+  [ -e "$VM_DIR" ] && die "$VM_DIR already exists but has no vm.conf; remove it manually"
+  mkdir -p "$VM_DIR/run" "$VM_DIR/logs" "$VM_DIR/ssh"
+  chmod 700 "$VM_DIR"
+  arm_create_cleanup
+
+  VM_NAME="$name"; VM_CREATED="$(now_iso)"; VM_RELEASE=imported; VM_VARIANT=imported
+  VM_IMAGE="$(basename "$src_disk")"; VM_IMAGE_SHA512=""; VM_CPUS="$OPT_CPUS"; VM_MEMORY="$OPT_MEMORY"
+  VM_DISK="${resize:-$vsize}"; VM_DISK_CACHE="$OPT_CACHE"; VM_MACHINE=virt; VM_BIND="$OPT_BIND"
+  VM_SSH_PORT="$OPT_SSH_PORT"; VM_FORWARDS="$OPT_FORWARDS"; VM_USER="$OPT_USER"
+  VM_SSH_PUBKEY="$pubkey"; VM_SSH_IDENTITY="$identity"; VM_TIMEZONE=""; VM_PASSWORD_HASH=""
+  VM_EXTRA_ARGS=""; VM_PROVISION=none; VM_BALLOON="$OPT_BALLOON"; VM_AUTOSTART=on
+  VM_ORIGIN="$(resolve_path "$src_disk")"
+  save_vm_conf
+  load_vm "$name"
+
+  info "cloning $src_disk ($vsize)"
+  cp -c "$src_disk" "$VM_DISK_PATH" 2>/dev/null || cp "$src_disk" "$VM_DISK_PATH"
+  chmod 600 "$VM_DISK_PATH"
+  if [ -n "$resize" ]; then
+    info "growing virtual disk to $resize (grow the guest filesystem yourself afterwards)"
+    "$MACVS_QEMU_IMG" resize -q "$VM_DISK_PATH" "$resize" || die "qemu-img resize failed"
+  fi
+  if [ -n "$src_nvram" ]; then
+    cp "$src_nvram" "$VM_NVRAM_PATH"
+  else
+    warn "no --nvram given: using a blank UEFI variable store. Systems installed from an ISO usually" \
+         "need their original NVRAM to find GRUB; if it does not boot, re-import with --nvram."
+    cp "$MACVS_FW_VARS" "$VM_NVRAM_PATH"
+  fi
+  chmod 600 "$VM_NVRAM_PATH"
+
+  disarm_create_cleanup
+  if [ -n "$move" ]; then
+    rm -f "$src_disk"; [ -z "$src_nvram" ] || rm -f "$src_nvram"
+    info "removed source files (--move)"
+  fi
+  ok "imported $name into $VM_DIR"
+  echo
+  cmd_status "$name"
+  bringup_vm
 }
 
 # ---------------------------------------------------------------------------
@@ -239,6 +400,20 @@ cmd_restart() {
   cmd_start "$1"
 }
 
+cmd_autostart() {
+  local name="${1:-}" mode="${2:-}"
+  [ -n "$name" ] || die "usage: macvs autostart <name> [on|off]"
+  load_vm "$name"
+  if [ -z "$mode" ]; then echo "$VM_AUTOSTART"; return 0; fi
+  [[ "$mode" =~ ^(on|off)$ ]] || die "usage: macvs autostart <name> [on|off]"
+  if [ "$VM_AUTOSTART" = "$mode" ]; then info "autostart for $VM_NAME is already $mode"; return 0; fi
+  VM_AUTOSTART="$mode"
+  save_vm_conf
+  launchd_refresh_plist
+  if [ "$mode" = on ]; then ok "$VM_NAME will boot with the Mac and restart after a crash"
+  else ok "$VM_NAME will stay off until 'macvs start $VM_NAME' (launchd job kept)"; fi
+}
+
 cmd_run() {
   [ $# -eq 1 ] || die "usage: macvs run <name>"
   load_vm "$1"
@@ -248,12 +423,15 @@ cmd_run() {
 cmd_wait() {
   [ $# -eq 1 ] || die "usage: macvs wait <name>"
   load_vm "$1"
-  vm_wait_ssh; vm_wait_cloudinit
+  vm_wait_ssh
+  [ "$VM_PROVISION" = cloud-init ] && vm_wait_cloudinit
+  return 0
 }
 
 cmd_reseed() {
   [ $# -eq 1 ] || die "usage: macvs reseed <name>"
   load_vm "$1"
+  [ "$VM_PROVISION" = cloud-init ] || die "$VM_NAME was imported and has no cloud-init seed"
   vm_is_running && die "stop $VM_NAME before reseeding"
   cloudinit_generate
   ok "rebuilt $VM_SEED_PATH (cloud-init will re-run per-instance modules on next boot)"
@@ -263,19 +441,21 @@ cmd_reseed() {
 cmd_status() {
   [ $# -eq 1 ] || die "usage: macvs status <name>"
   load_vm "$1"
-  local pid state kind lstate disk_used f
+  local pid state kind lstate disk_used f prov
   if pid="$(vm_pid)"; then state="${C_GRN}running${C_RST} (pid $pid, up $(vm_uptime "$pid"))"; else state="${C_DIM}stopped${C_RST}"; fi
   kind="$(launchd_kind "$VM_NAME")"
-  if [ -n "$kind" ]; then lstate="$(launchd_state "$VM_NAME" || true)"; kind="$kind (${lstate:-not loaded})"; else kind="none (direct start)"; fi
+  if [ -n "$kind" ]; then lstate="$(launchd_state "$VM_NAME" || true)"; kind="$kind (${lstate:-not loaded}), autostart $VM_AUTOSTART"
+  else kind="none (direct start)"; fi
   disk_used="$(du -h "$VM_DISK_PATH" 2>/dev/null | awk '{print $1}')"
+  if [ "$VM_PROVISION" = cloud-init ]; then prov="$VM_IMAGE ($VM_RELEASE), cloud-init"
+  else prov="imported from $VM_ORIGIN"; fi
   printf '%s%s%s\n' "$C_BOLD" "$VM_NAME" "$C_RST"
   printf '  state      %b\n' "$state"
-  printf '  image      %s (%s)\n' "$VM_IMAGE" "$VM_RELEASE"
-  printf '  resources  %s vCPU, %s MiB RAM, %s disk (%s used)\n' "$VM_CPUS" "$VM_MEMORY" "$VM_DISK" "${disk_used:-?}"
+  printf '  image      %s\n' "$prov"
+  printf '  resources  %s vCPU, %s MiB RAM%s, %s disk (%s used)\n' "$VM_CPUS" "$VM_MEMORY" \
+    "$([ "$VM_BALLOON" = on ] && echo ' (balloon)')" "$VM_DISK" "${disk_used:-?}"
   printf '  ssh        %s@%s -p %s\n' "$VM_USER" "$VM_SSH_HOST" "$VM_SSH_PORT"
-  if [ -n "$VM_FORWARDS" ]; then
-    for f in $VM_FORWARDS; do printf '  forward    %s:%s -> guest:%s\n' "$VM_BIND" "${f%%:*}" "${f##*:}"; done
-  fi
+  for f in $VM_FORWARDS; do printf '  forward    %s:%s -> guest:%s\n' "$VM_BIND" "${f%%:*}" "${f##*:}"; done
   printf '  bind       %s\n' "$VM_BIND"
   printf '  launchd    %s\n' "$kind"
   printf '  files      %s\n' "$VM_DIR"
@@ -283,14 +463,14 @@ cmd_status() {
 
 cmd_list() {
   local d n pid state kind
-  printf '%-24s %-10s %-8s %-8s %-6s %-8s %s\n' NAME STATE PID SSH CPUS MEM LAUNCHD
+  printf '%-24s %-9s %-7s %-6s %-5s %-6s %-8s %s\n' NAME STATE PID SSH CPUS MEM LAUNCHD AUTOSTART
   for d in "$MACVS_HOME"/vms/*/; do
     [ -f "$d/vm.conf" ] || continue
     n="$(basename "$d")"
     load_vm "$n"
     if pid="$(vm_pid)"; then state=running; else state=stopped; pid=-; fi
     kind="$(launchd_kind "$n")"
-    printf '%-24s %-10s %-8s %-8s %-6s %-8s %s\n' "$n" "$state" "$pid" "$VM_SSH_PORT" "$VM_CPUS" "$VM_MEMORY" "${kind:--}"
+    printf '%-24s %-9s %-7s %-6s %-5s %-6s %-8s %s\n' "$n" "$state" "$pid" "$VM_SSH_PORT" "$VM_CPUS" "$VM_MEMORY" "${kind:--}" "$VM_AUTOSTART"
   done
 }
 
@@ -374,8 +554,8 @@ cmd_daemon() {
       load_vm "$name"
       kind="$(launchd_kind "$VM_NAME")"
       [ -n "$kind" ] || { echo "no launchd job for $VM_NAME"; return 0; }
-      printf 'kind:   %s\nlabel:  %s\nplist:  %s\nstate:  %s\n' "$kind" "$(launchd_label "$VM_NAME")" \
-        "$(launchd_plist_path "$VM_NAME" "$kind")" "$(launchd_state "$VM_NAME" || echo 'not loaded')" ;;
+      printf 'kind:       %s\nlabel:      %s\nplist:      %s\nstate:      %s\nautostart:  %s\n' "$kind" "$(launchd_label "$VM_NAME")" \
+        "$(launchd_plist_path "$VM_NAME" "$kind")" "$(launchd_state "$VM_NAME" || echo 'not loaded')" "$VM_AUTOSTART" ;;
     plist)
       [ -n "$name" ] || die "usage: macvs daemon plist <name> [--system|--agent]"
       load_vm "$name"; qemu_detect; launchd_render_plist "${kind:-system}" ;;
@@ -402,33 +582,43 @@ cmd_image() {
 }
 
 cmd_doctor() {
-  local fails=0
+  local fails=0 r q t o
   check() { # label ok? detail
-    if [ "$2" = 0 ]; then printf '  %sok%s   %-28s %s\n' "$C_GRN" "$C_RST" "$1" "$3"
-    else printf '  %sFAIL%s %-28s %s\n' "$C_RED" "$C_RST" "$1" "$3"; fails=$((fails + 1)); fi
+    if [ "$2" = 0 ]; then printf '  %sok%s   %-30s %s\n' "$C_GRN" "$C_RST" "$1" "$3"
+    else printf '  %sFAIL%s %-30s %s\n' "$C_RED" "$C_RST" "$1" "$3"; fails=$((fails + 1)); fi
   }
-  note() { printf '  %snote%s %-28s %s\n' "$C_YEL" "$C_RST" "$1" "$2"; }
+  note() { printf '  %snote%s %-30s %s\n' "$C_YEL" "$C_RST" "$1" "$2"; }
   echo "macvs doctor"
-  [ "$(uname -s)" = Darwin ] && r=0 || r=1; check "macOS" $r "$(sw_vers -productVersion 2>/dev/null)"
-  [ "$(uname -m)" = arm64 ] && r=0 || r=1; check "Apple Silicon (arm64)" $r "$(uname -m)"
-  hvf_available && r=0 || r=1; check "Hypervisor.framework" $r "kern.hv_support=$(sysctl -n kern.hv_support 2>/dev/null)"
-  local q; q="$(command -v qemu-system-aarch64 2>/dev/null || true)"
-  [ -n "$q" ] && r=0 || r=1; check "qemu-system-aarch64" $r "${q:-missing: brew install qemu} $("$q" --version 2>/dev/null | head -n 1 | awk '{print $4}')"
-  command -v qemu-img >/dev/null 2>&1 && r=0 || r=1; check "qemu-img" $r "$(command -v qemu-img 2>/dev/null)"
+  [ "$(uname -s)" = Darwin ] && r=0 || r=1; check "macOS" "$r" "$(sw_vers -productVersion 2>/dev/null)"
+  [ "$(uname -m)" = arm64 ] && r=0 || r=1; check "Apple Silicon (arm64)" "$r" "$(uname -m)"
+  hvf_available && r=0 || r=1; check "Hypervisor.framework" "$r" "kern.hv_support=$(sysctl -n kern.hv_support 2>/dev/null)"
+  q="$(command -v qemu-system-aarch64 2>/dev/null || true)"
+  [ -n "$q" ] && r=0 || r=1; check "qemu-system-aarch64" "$r" "${q:-missing: brew install qemu} $("$q" --version 2>/dev/null | head -n 1 | awk '{print $4}')"
+  command -v qemu-img >/dev/null 2>&1 && r=0 || r=1; check "qemu-img" "$r" "$(command -v qemu-img 2>/dev/null)"
   if [ -n "$q" ]; then
     ( qemu_detect ) >/dev/null 2>&1 && r=0 || r=1
-    ( qemu_detect >/dev/null 2>&1; check "UEFI firmware" $r "${MACVS_QEMU_SHARE:-not found}" )
+    ( qemu_detect >/dev/null 2>&1; check "UEFI firmware" "$r" "${MACVS_QEMU_SHARE:-not found}" )
   fi
   for t in hdiutil curl shasum ssh ssh-keygen nc plutil launchctl; do
-    command -v "$t" >/dev/null 2>&1 && r=0 || r=1; check "$t" $r "$(command -v "$t" 2>/dev/null)"
+    command -v "$t" >/dev/null 2>&1 && r=0 || r=1; check "$t" "$r" "$(command -v "$t" 2>/dev/null)"
   done
-  mkdir -p "$MACVS_HOME" 2>/dev/null && [ -w "$MACVS_HOME" ] && r=0 || r=1; check "MACVS_HOME writable" $r "$MACVS_HOME"
+  mkdir -p "$MACVS_HOME" 2>/dev/null && [ -w "$MACVS_HOME" ] && r=0 || r=1; check "MACVS_HOME writable" "$r" "$MACVS_HOME"
   if tcc_protected_path "$MACVS_HOME"; then r=1; else r=0; fi
-  check "MACVS_HOME outside TCC folders" $r "$MACVS_HOME"
-  if tcc_protected_path "$MACVS_BIN_DIR"; then r=1; else r=0; fi
-  if [ $r = 1 ]; then check "macvs outside TCC folders" 1 "$MACVS_BIN_DIR (launchd cannot run it here; use ./install.sh)"; else check "macvs outside TCC folders" 0 "$MACVS_BIN_DIR"; fi
-  if password_hash x >/dev/null 2>&1; then r=0; else r=1; fi
-  [ $r = 0 ] && check "openssl passwd -6 (optional)" 0 "available for --password" || note "openssl passwd -6 (optional)" "brew install openssl@3 to use --password"
+  check "MACVS_HOME outside TCC folders" "$r" "$MACVS_HOME"
+  if tcc_protected_path "$MACVS_BIN_DIR"; then
+    check "macvs outside TCC folders" 1 "$MACVS_BIN_DIR (launchd cannot run it here; use ./install.sh)"
+  else
+    check "macvs outside TCC folders" 0 "$MACVS_BIN_DIR"
+  fi
+  # Web ports: informational, since only one VM can own them.
+  for t in ${MACVS_DEFAULT_WEB_FORWARDS}; do
+    t="${t%%:*}"
+    if o="$(port_used_by_vm "$t")"; then note "host port $t" "used by VM '$o'"
+    elif port_listening "$t"; then note "host port $t" "in use by something else on this Mac; new VMs need --no-web or --forward"
+    else note "host port $t" "free"; fi
+  done
+  if password_hash x >/dev/null 2>&1; then check "openssl passwd -6 (optional)" 0 "available for --password"
+  else note "openssl passwd -6 (optional)" "brew install openssl@3 to use --password"; fi
   if sudo -n true 2>/dev/null; then note "sudo" "passwordless"; else note "sudo" "will prompt when installing a system LaunchDaemon"; fi
   echo
   if [ "$fails" = 0 ]; then ok "this Mac is ready for macvs"; else die "$fails problem(s) found"; fi
@@ -440,9 +630,11 @@ main() {
   shift || true
   case "$cmd" in
     create)      cmd_create "$@" ;;
+    import)      cmd_import "$@" ;;
     start)       cmd_start "$@" ;;
     stop)        cmd_stop "$@" ;;
     restart)     cmd_restart "$@" ;;
+    autostart)   cmd_autostart "$@" ;;
     run)         cmd_run "$@" ;;
     destroy|rm)  cmd_destroy "$@" ;;
     list|ls)     cmd_list "$@" ;;
